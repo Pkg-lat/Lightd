@@ -146,7 +146,7 @@ pub async fn restore_snapshot(
         return Ok(Json(ApiResponse::error(format!("Snapshot {} not found", snapshot_id))));
     }
     
-    let result = snapshot_manager.restore_snapshot(&snapshot_id, &container_id).await;
+    let result = snapshot_manager.restore_snapshot(&snapshot_id, &container_uuid).await;
     
     let _ = state.state_manager.unlock_container(&container_uuid).await;
     
