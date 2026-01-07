@@ -33,6 +33,12 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // Skip auth for WebSocket routes (they use their own token-based auth)
+    let path = request.uri().path();
+    if path == "/websocket" || path.starts_with("/websocket/") {
+        return next.run(request).await;
+    }
+
     // Extract Authorization header
     let auth_header = request
         .headers()
