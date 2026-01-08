@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 use bollard::Docker;
 use bollard::container::{StopContainerOptions, KillContainerOptions};
 

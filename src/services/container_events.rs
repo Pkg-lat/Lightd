@@ -20,12 +20,16 @@ pub enum ContainerEvent {
     Stats(EventContainerStats),
     /// Console output from container
     ConsoleOutput { line: String },
+    /// Duplicate console output detected
+    DuplicateOutput { line: String },
     /// Daemon message
     DaemonMessage { message: String },
     /// Power action started
     PowerActionStarted { action: String },
     /// Power action completed
     PowerActionCompleted { action: String, success: bool, message: String },
+    /// Docker event (start, stop, die, pause, unpause, etc.)
+    DockerEvent { action: String, status: String },
 }
 
 /// Container stats for broadcast
@@ -160,6 +164,21 @@ impl ContainerEventHub {
             action: action.to_string(),
             success,
             message: message.to_string(),
+        }).await;
+    }
+
+    /// Broadcast duplicate console output (for duplicate detection)
+    pub async fn broadcast_duplicate(&self, container_id: &str, line: &str) {
+        self.broadcast(container_id, ContainerEvent::DuplicateOutput {
+            line: line.to_string(),
+        }).await;
+    }
+
+    /// Broadcast Docker event (container lifecycle events)
+    pub async fn broadcast_docker_event(&self, container_id: &str, action: &str, status: &str) {
+        self.broadcast(container_id, ContainerEvent::DockerEvent {
+            action: action.to_string(),
+            status: status.to_string(),
         }).await;
     }
 

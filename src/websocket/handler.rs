@@ -7,10 +7,11 @@
 use axum::extract::ws::{Message, WebSocket};
 use bollard::container::{LogOutput, LogsOptions, StatsOptions};
 use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::system::EventsOptions;
 use chrono::{DateTime, FixedOffset};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
@@ -143,6 +144,13 @@ impl WebSocketHandler {
             None
         };
 
+        // Always spawn Docker events streamer to catch state changes
+        let docker_events_task = Self::spawn_docker_events_streamer(
+            docker.clone(),
+            container_id.clone(),
+            event_hub.clone(),
+        );
+
         let mut container_running = is_running;
         let mut current_log_task: Option<tokio::task::JoinHandle<()>> = log_task;
         let mut current_stats_task: Option<tokio::task::JoinHandle<()>> = stats_task;
@@ -176,6 +184,10 @@ impl WebSocketHandler {
                             let msg = WsMessage::console_output(&line).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
+                        Ok(ContainerEvent::DuplicateOutput { line }) => {
+                            let msg = WsMessage::duplicate_event(&line).to_json();
+                            if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
+                        }
                         Ok(ContainerEvent::Stats(stats)) => {
                             let msg = WsMessage::stats(
                                 stats.memory_bytes, stats.memory_limit_bytes, stats.cpu_percent,
@@ -183,6 +195,10 @@ impl WebSocketHandler {
                                 if container_running { "running" } else { "stopped" },
                                 stats.disk_bytes,
                             ).to_json();
+                            if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
+                        }
+                        Ok(ContainerEvent::DockerEvent { action, status }) => {
+                            let msg = WsMessage::docker_event(&action, &status).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
                         Ok(ContainerEvent::DaemonMessage { message }) => {
@@ -250,6 +266,7 @@ impl WebSocketHandler {
 
         if let Some(task) = current_log_task { task.abort(); }
         if let Some(task) = current_stats_task { task.abort(); }
+        docker_events_task.abort();
         event_hub.unsubscribe(&container_id).await;
         info!("WebSocket closed for container: {}", container_id);
     }
@@ -360,6 +377,9 @@ impl WebSocketHandler {
                                         if !recent.seen_or_insert(key) {
                                             backoff = Duration::from_millis(250);
                                             event_hub.broadcast_console(&container_id, content).await;
+                                        } else {
+                                            // Broadcast duplicate event instead of silently skipping
+                                            event_hub.broadcast_duplicate(&container_id, content).await;
                                         }
                                     }
                                 }
@@ -433,6 +453,9 @@ impl WebSocketHandler {
 
                                 if !recent.seen_or_insert(key) {
                                     event_hub.broadcast_console(&container_id, content).await;
+                                } else {
+                                    // Broadcast duplicate event instead of silently skipping
+                                    event_hub.broadcast_duplicate(&container_id, content).await;
                                 }
                             }
                         }
@@ -524,6 +547,99 @@ impl WebSocketHandler {
 
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        })
+    }
+
+    /// Spawn a Docker events streamer to listen for container lifecycle events
+    fn spawn_docker_events_streamer(
+        docker: Arc<bollard::Docker>,
+        container_id: String,
+        event_hub: Arc<ContainerEventHub>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(250);
+
+            loop {
+                // Filter events for this specific container
+                let mut filters = HashMap::new();
+                filters.insert("container".to_string(), vec![container_id.clone()]);
+                filters.insert("type".to_string(), vec!["container".to_string()]);
+
+                let opts = EventsOptions {
+                    since: None,
+                    until: None,
+                    filters,
+                };
+
+                let mut stream = docker.events(Some(opts));
+
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(event) => {
+                            backoff = Duration::from_millis(250);
+
+                            let action = event.action.as_deref().unwrap_or("unknown");
+                            // Get status from actor attributes if available
+                            let status = event.actor
+                                .as_ref()
+                                .and_then(|a| a.attributes.as_ref())
+                                .and_then(|attrs| attrs.get("exitCode"))
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
+
+                            // Map Docker actions to power states
+                            let power_state = match action {
+                                "start" => "running",
+                                "stop" | "kill" | "die" => "stopped",
+                                "pause" => "paused",
+                                "unpause" => "running",
+                                "create" => "created",
+                                "destroy" => "destroyed",
+                                "restart" => "running",
+                                "oom" => "oom",
+                                _ => action,
+                            };
+
+                            debug!(
+                                "Docker event for {}: action={}, status={}, power={}",
+                                container_id, action, status, power_state
+                            );
+
+                            // Broadcast the Docker event
+                            event_hub.broadcast_docker_event(&container_id, action, power_state).await;
+
+                            // Also broadcast state change for relevant actions
+                            match action {
+                                "start" => {
+                                    event_hub.broadcast_state(&container_id, "running").await;
+                                }
+                                "stop" | "kill" | "die" => {
+                                    event_hub.broadcast_state(&container_id, "stopped").await;
+                                }
+                                "pause" => {
+                                    event_hub.broadcast_state(&container_id, "paused").await;
+                                }
+                                "unpause" => {
+                                    event_hub.broadcast_state(&container_id, "running").await;
+                                }
+                                "restart" => {
+                                    // Restart triggers stop then start, so we'll get both events
+                                    event_hub.broadcast_state(&container_id, "running").await;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Docker events stream error for {}: {}", container_id, e);
+                            break;
+                        }
+                    }
+                }
+
+                // Stream ended, reconnect after backoff
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(10));
             }
         })
     }

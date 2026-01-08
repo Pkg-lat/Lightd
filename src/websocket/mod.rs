@@ -25,6 +25,8 @@ pub enum WsEvent {
     Init,
     /// Console output from container
     ConsoleOutput,
+    /// Duplicate console output detected (not sent as console_output)
+    DuplicateEvent,
     /// Container status change
     Status,
     /// Container stats (CPU, memory, network, etc.)
@@ -33,6 +35,8 @@ pub enum WsEvent {
     Error,
     /// Daemon/system message
     DaemonMessage,
+    /// Docker event (start, stop, die, etc.)
+    DockerEvent,
 }
 
 /// WebSocket message format
@@ -85,6 +89,22 @@ impl WsMessage {
         Self {
             event: WsEvent::DaemonMessage,
             args: vec!["[container@pkg.lat]: ".to_string() + msg],
+        }
+    }
+
+    /// Create duplicate event message (when duplicate console output is detected)
+    pub fn duplicate_event(line: &str) -> Self {
+        Self {
+            event: WsEvent::DuplicateEvent,
+            args: vec![line.to_string()],
+        }
+    }
+
+    /// Create docker event message (container lifecycle events from Docker)
+    pub fn docker_event(action: &str, status: &str) -> Self {
+        Self {
+            event: WsEvent::DockerEvent,
+            args: vec![action.to_string(), status.to_string()],
         }
     }
 
