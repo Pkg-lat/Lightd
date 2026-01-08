@@ -5,3 +5,5 @@ pub mod monitoring;
 pub mod snapshot;
 pub mod websocket;
 pub mod network;
+pub mod storage_volume;
+pub mod firewall;

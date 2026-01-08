@@ -10,8 +10,10 @@ pub mod monitoring;
 pub mod websocket;
 pub mod remote;
 pub mod services;
+pub mod firewall;
 
 pub use config::Config;
 pub use docker::DockerClient;
 pub use types::AppState;
 pub use services::PowerActionService;
+pub use firewall::FirewallManager;

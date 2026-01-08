@@ -807,4 +807,315 @@ impl ContainerLifecycleManager {
             }
         }
     }
+
+    /// Swap the /home/container mount to a different volume path
+    /// This recreates the container with the new volume attached
+    pub async fn swap_mount(
+        &self,
+        uuid: &str,
+        new_volume_path: &str,
+    ) -> Result<String, String> {
+        info!("Lifecycle: Swapping mount for {} to {}", uuid, new_volume_path);
+
+        // 1. Lock the container
+        self.state_manager.lock_container(uuid, "Swapping mount").await
+            .map_err(|e| format!("Failed to lock container: {}", e))?;
+        self.state_manager.update_container_state(uuid, "recreating").await
+            .map_err(|e| format!("Failed to update state: {}", e))?;
+
+        // 2. Load current tracker data
+        let tracker = match self.container_tracker.get_container(uuid).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.unlock_container(uuid).await;
+                return Err("Container tracker data not found".to_string());
+            }
+            Err(e) => {
+                self.unlock_container(uuid).await;
+                return Err(format!("Failed to load container data: {}", e));
+            }
+        };
+
+        let old_container_id = tracker.container_id.clone();
+        let manager = ContainerManager::new(self.docker.as_ref().clone());
+
+        // 3. Stop and remove old container
+        info!("Lifecycle: Stopping old container {} for mount swap", old_container_id);
+        let _ = manager.stop(&old_container_id).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        info!("Lifecycle: Removing old container {}", old_container_id);
+        if let Err(e) = manager.remove(&old_container_id).await {
+            warn!("Lifecycle: Failed to remove old container (may not exist): {}", e);
+        }
+
+        // 4. Release old port allocations
+        {
+            let mut net_mgr = self.network.write().await;
+            for alloc in &tracker.allocated_ports {
+                if let Ok(port) = alloc.host_port.parse::<u16>() {
+                    net_mgr.release_port(port);
+                    info!("Lifecycle: Released port {} for mount swap", port);
+                }
+            }
+        }
+
+        // 5. Build port config from tracker's allocated_ports
+        let ports_map: HashMap<String, String> = tracker.allocated_ports
+            .iter()
+            .map(|p| (p.container_port.clone(), p.host_port.clone()))
+            .collect();
+
+        // 6. Create new container with custom volume path
+        info!("Lifecycle: Creating new container for {} with volume {}", uuid, new_volume_path);
+        
+        // Create container with custom volume binding
+        let result = self.create_container_with_custom_volume(
+            uuid,
+            &tracker,
+            new_volume_path,
+            ports_map,
+        ).await;
+
+        match result {
+            Ok(new_container_id) => {
+                info!("Lifecycle: Mount swap complete for {}, new ID: {}", uuid, new_container_id);
+                
+                // Update tracker with custom volume info
+                let mut updated_tracker = tracker.clone();
+                updated_tracker.container_id = new_container_id.clone();
+                
+                // Add custom volume to attached_volumes
+                let custom_volume = crate::models::VolumeMount {
+                    source: new_volume_path.to_string(),
+                    target: "/home/container".to_string(),
+                    read_only: Some(false),
+                };
+                updated_tracker.attached_volumes = vec![custom_volume];
+                
+                self.container_tracker.save_container(&updated_tracker).await.ok();
+                self.state_manager.update_container_id(uuid, &new_container_id).await.ok();
+                self.state_manager.update_container_state(uuid, "stopped").await.ok();
+                
+                self.unlock_container(uuid).await;
+                Ok(new_container_id)
+            }
+            Err(e) => {
+                error!("Lifecycle: Failed to create container with new mount: {}", e);
+                self.state_manager.update_container_state(uuid, "failed").await.ok();
+                self.unlock_container(uuid).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Reset mount to default volume (container's own volume)
+    pub async fn reset_mount(
+        &self,
+        uuid: &str,
+    ) -> Result<String, String> {
+        let default_volume_path = format!("{}/{}", self.volumes_path, uuid);
+        info!("Lifecycle: Resetting mount for {} to default {}", uuid, default_volume_path);
+
+        // 1. Lock the container
+        self.state_manager.lock_container(uuid, "Resetting mount").await
+            .map_err(|e| format!("Failed to lock container: {}", e))?;
+        self.state_manager.update_container_state(uuid, "recreating").await
+            .map_err(|e| format!("Failed to update state: {}", e))?;
+
+        // 2. Load current tracker data
+        let tracker = match self.container_tracker.get_container(uuid).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.unlock_container(uuid).await;
+                return Err("Container tracker data not found".to_string());
+            }
+            Err(e) => {
+                self.unlock_container(uuid).await;
+                return Err(format!("Failed to load container data: {}", e));
+            }
+        };
+
+        let old_container_id = tracker.container_id.clone();
+        let manager = ContainerManager::new(self.docker.as_ref().clone());
+
+        // 3. Stop and remove old container
+        info!("Lifecycle: Stopping old container {} for mount reset", old_container_id);
+        let _ = manager.stop(&old_container_id).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        info!("Lifecycle: Removing old container {}", old_container_id);
+        if let Err(e) = manager.remove(&old_container_id).await {
+            warn!("Lifecycle: Failed to remove old container (may not exist): {}", e);
+        }
+
+        // 4. Release old port allocations
+        {
+            let mut net_mgr = self.network.write().await;
+            for alloc in &tracker.allocated_ports {
+                if let Ok(port) = alloc.host_port.parse::<u16>() {
+                    net_mgr.release_port(port);
+                }
+            }
+        }
+
+        // 5. Build port config
+        let ports_map: HashMap<String, String> = tracker.allocated_ports
+            .iter()
+            .map(|p| (p.container_port.clone(), p.host_port.clone()))
+            .collect();
+
+        // 6. Recreate using standard method (uses default volume)
+        let create_req = CreateContainerRequest {
+            image: tracker.image.clone(),
+            name: Some(tracker.name.clone()),
+            description: tracker.description.clone(),
+            startup_command: Some(vec!["/bin/sh".to_string(), "/data/entrypoint.sh".to_string()]),
+            env: tracker.env.clone(),
+            ports: if ports_map.is_empty() { None } else { Some(ports_map) },
+            volumes: None, // Use default volume
+            command: None,
+            working_dir: None,
+            restart_policy: None,
+            custom_uuid: Some(uuid.to_string()),
+            limits: Some(tracker.limits.clone()),
+            install_content: None,
+            update_content: tracker.update_content.clone(),
+        };
+
+        match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
+            Ok((new_container_id, allocations)) => {
+                info!("Lifecycle: Mount reset complete for {}, new ID: {}", uuid, new_container_id);
+
+                // Update tracker - clear custom volumes
+                let mut updated_tracker = tracker.clone();
+                updated_tracker.container_id = new_container_id.clone();
+                updated_tracker.allocated_ports = allocations;
+                updated_tracker.attached_volumes = vec![]; // Clear custom volumes
+                
+                self.container_tracker.save_container(&updated_tracker).await.ok();
+                self.state_manager.update_container_id(uuid, &new_container_id).await.ok();
+                self.state_manager.update_container_state(uuid, "stopped").await.ok();
+
+                self.unlock_container(uuid).await;
+                Ok(new_container_id)
+            }
+            Err(e) => {
+                error!("Lifecycle: Failed to reset mount: {}", e);
+                self.state_manager.update_container_state(uuid, "failed").await.ok();
+                self.unlock_container(uuid).await;
+                Err(format!("Failed to create container: {}", e))
+            }
+        }
+    }
+
+    /// Helper to create container with custom volume path
+    async fn create_container_with_custom_volume(
+        &self,
+        uuid: &str,
+        tracker: &crate::models::ContainerTracker,
+        volume_path: &str,
+        ports_map: HashMap<String, String>,
+    ) -> Result<String, String> {
+        // Get absolute paths
+        let abs_volume_path = std::fs::canonicalize(volume_path)
+            .map_err(|e| format!("Failed to get absolute volume path: {}", e))?
+            .to_string_lossy()
+            .to_string();
+        
+        let data_path = format!("{}/{}_data", self.volumes_path, uuid);
+        let abs_data_path = std::fs::canonicalize(&data_path)
+            .map_err(|e| format!("Failed to get absolute data path: {}", e))?
+            .to_string_lossy()
+            .to_string();
+
+        // Allocate ports
+        let allocated_ports = if !ports_map.is_empty() {
+            let mut net_mgr = self.network.write().await;
+            net_mgr.auto_allocate_ports(uuid, &ports_map)
+                .map_err(|e| format!("Port allocation failed: {}", e))?
+        } else {
+            HashMap::new()
+        };
+
+        // Build port bindings
+        let mut port_bindings = std::collections::HashMap::new();
+        let mut exposed_ports = std::collections::HashMap::new();
+
+        for (container_port, host_port) in &allocated_ports {
+            let port_spec = format!("{}/tcp", container_port);
+            exposed_ports.insert(port_spec.clone(), std::collections::HashMap::new());
+            
+            port_bindings.insert(
+                port_spec,
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(host_port.clone()),
+                }]),
+            );
+        }
+
+        // Build environment variables
+        let mut env_vars: Vec<String> = tracker.env.as_ref()
+            .map(|e| e.iter().map(|(k, v)| format!("{}={}", k, v)).collect())
+            .unwrap_or_default();
+        
+        env_vars.push("LIGHTD_MANAGED=true".to_string());
+
+        // Create container config
+        let config = bollard::container::Config {
+            image: Some(tracker.image.clone()),
+            cmd: Some(vec!["/bin/sh".to_string(), "/data/entrypoint.sh".to_string()]),
+            working_dir: Some("/home/container".to_string()),
+            tty: Some(true),
+            open_stdin: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            env: Some(env_vars),
+            exposed_ports: if exposed_ports.is_empty() { None } else { Some(exposed_ports) },
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![
+                    format!("{}:/home/container", abs_volume_path),
+                    format!("{}:/data:ro", abs_data_path),
+                ]),
+                port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
+                oom_kill_disable: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let options = bollard::container::CreateContainerOptions {
+            name: uuid,
+            platform: None,
+        };
+
+        // Create container
+        let response = self.docker.create_container(Some(options), config).await
+            .map_err(|e| format!("Failed to create container: {}", e))?;
+
+        // Update port allocations in tracker
+        let port_allocs: Vec<PortAllocation> = allocated_ports
+            .into_iter()
+            .map(|(cp, hp)| PortAllocation {
+                container_port: cp,
+                host_port: hp,
+                host_ip: "0.0.0.0".to_string(),
+                protocol: "tcp".to_string(),
+            })
+            .collect();
+
+        // Save updated tracker
+        let mut updated_tracker = tracker.clone();
+        updated_tracker.container_id = response.id.clone();
+        updated_tracker.allocated_ports = port_allocs;
+        self.container_tracker.save_container(&updated_tracker).await.ok();
+
+        Ok(response.id)
+    }
 }

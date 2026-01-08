@@ -12,6 +12,7 @@ use crate::{
     monitoring::ResourceMonitor,
     websocket::TokenManager,
     services::{PowerActionService, PowerExecutor, ContainerEventHub, AsyncPowerManager, ContainerLifecycleManager},
+    firewall::FirewallManager,
 };
 use tokio::sync::RwLock;
 
@@ -37,4 +38,6 @@ pub struct AppState {
     pub async_power: Arc<AsyncPowerManager>,
     /// Container lifecycle manager for stateless container recreation
     pub lifecycle: Arc<ContainerLifecycleManager>,
+    /// Firewall manager for per-container iptables rules
+    pub firewall: Arc<FirewallManager>,
 }

@@ -31,6 +31,7 @@ mod monitoring;
 mod websocket;
 mod remote;
 mod services;
+mod firewall;
 
 use auth::{auth_middleware, AuthState};
 use container_tracker::ContainerTrackingManager;
@@ -142,6 +143,8 @@ enum NetworkCommands {
         name: String,
     },
     /// Setup complete lightd networking
+    /// Default setup, this usually works everywhere including wings
+    /// So we'll make it the default
     Setup {
         #[arg(short, long, default_value = "lightd-network")]
         name: String,
@@ -327,7 +330,7 @@ async fn network_exists(docker: &Docker, name: &str) -> anyhow::Result<bool> {
 async fn start_daemon() -> anyhow::Result<()> {
     let config = Config::load("config.json").await?;
   
-    let version = "1.0.0"; // later get from config.json
+    //let version = "1.0.0"; // later get from config.json
     let ascii_art = format!(
 r#"      
     __    _       __    __      __
@@ -337,17 +340,12 @@ r#"
 /_____/_/\__, /_/ /_/\__/\__,_/   
         /____/                           
                                                           
-NightLight Daemon v{} (Liberal)
-(c) 2025 Nadhi.dev
-"#,
-        version
-    );
-
-    
-
+Lightd Daemon v{}
+(c) 2025-present Nadhi.dev
+"#, config.version);
 
   
-    info!("{}", ascii_art);
+    println!("{}", ascii_art);
     info!("Tokio runtime configured with {} worker threads", config.server.worker_threads);
     
     let docker = DockerClient::new(&config.docker.socket_path).await?;
@@ -525,6 +523,10 @@ NightLight Daemon v{} (Liberal)
         config.monitoring.as_ref().and_then(|m| m.remote.clone()),
     ));
 
+    // Initialize firewall manager
+    let firewall_manager = Arc::new(firewall::FirewallManager::new().await);
+    info!("Firewall manager initialized (iptables available: {})", firewall_manager.is_available());
+
     let state = AppState {
         docker: docker_arc,
         config: Arc::new(config.clone()),
@@ -540,6 +542,7 @@ NightLight Daemon v{} (Liberal)
         async_power,
         lifecycle,
         remote: Some(remote_client),
+        firewall: firewall_manager,
     };
 
     let app = Router::new()
@@ -620,6 +623,27 @@ NightLight Daemon v{} (Liberal)
         .route("/volumes", post(handlers::volume::create_volume))
         .route("/volumes", get(handlers::volume::list_volumes))
         .route("/volumes/:name", delete(handlers::volume::remove_volume))
+        // Storage volume management (host-based volumes)
+        .route("/storage/volumes", post(handlers::storage_volume::create_storage_volume))
+        .route("/storage/volumes", get(handlers::storage_volume::list_storage_volumes))
+        .route("/storage/volumes/clone", post(handlers::storage_volume::clone_volume_from_container))
+        .route("/storage/volumes/:volume_id", get(handlers::storage_volume::get_storage_volume))
+        .route("/storage/volumes/:volume_id", delete(handlers::storage_volume::delete_storage_volume))
+        // Mount management
+        .route("/containers/:id/mount", get(handlers::storage_volume::get_container_mount))
+        .route("/containers/:id/mount/swap", post(handlers::storage_volume::swap_container_mount))
+        .route("/containers/:id/mount/reset", post(handlers::storage_volume::reset_container_mount))
+        // Firewall management
+        .route("/firewall/status", get(handlers::firewall::get_firewall_availability))
+        .route("/containers/:id/firewall", get(handlers::firewall::get_firewall_status))
+        .route("/containers/:id/firewall/rules", get(handlers::firewall::get_firewall_rules))
+        .route("/containers/:id/firewall/rules", post(handlers::firewall::add_firewall_rule))
+        .route("/containers/:id/firewall/rules/:rule_id", delete(handlers::firewall::remove_firewall_rule))
+        .route("/containers/:id/firewall/enabled", post(handlers::firewall::set_firewall_enabled))
+        .route("/containers/:id/firewall/policies", post(handlers::firewall::set_firewall_policies))
+        .route("/containers/:id/firewall/preset", post(handlers::firewall::apply_firewall_preset))
+        .route("/containers/:id/firewall/init", post(handlers::firewall::init_container_firewall))
+        .route("/containers/:id/firewall/cleanup", post(handlers::firewall::cleanup_container_firewall))
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn_with_state(
             AuthState::new(config.authorization.clone()),

@@ -5,6 +5,7 @@ pub mod network;
 pub mod filesystem;
 pub mod filesystem_direct;
 pub mod snapshot;
+pub mod storage_volume;
 
 pub use client::DockerClient;
 pub use container::ContainerManager;
@@ -13,3 +14,4 @@ pub use network::NetworkManager;
 pub use filesystem::{FilesystemManager, FileInfo, DirectoryListing};
 pub use filesystem_direct::FilesystemManagerDirect;
 pub use snapshot::SnapshotManager;
+pub use storage_volume::{StorageVolumeManager, StorageVolumeInfo, StorageVolumeMetadata};
