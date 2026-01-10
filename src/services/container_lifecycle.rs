@@ -763,24 +763,23 @@ impl ContainerLifecycleManager {
         tokio::fs::write(&entrypoint_path, &startup_cmd).await
             .map_err(|e| format!("Failed to update entrypoint: {}", e))?;
 
-        // 17. Restart the SAME container - it will now run the startup command
+        // 17. Start the SAME container - it will now run the startup command
         // The container preserves all installed packages (apk, apt, etc.)
-        info!("Lifecycle: Restarting container {} with startup command", new_container_id);
+        // Container is stopped after install completes, so we just start it
+        info!("Lifecycle: Starting container {} with startup command", new_container_id);
         if let Err(e) = manager.start(&new_container_id).await {
-            // This is expected to fail if container is already stopped
-            // Docker restart might work better
-            warn!("Lifecycle: Start failed (trying restart): {}", e);
-            
-            // Try docker restart instead
-            if let Err(e2) = self.docker.restart_container(&new_container_id, None).await {
-                warn!("Lifecycle: Restart also failed: {}", e2);
-                // Container is stopped but ready - user can start it manually
-            }
+            warn!("Lifecycle: Failed to start container after install: {}", e);
+            // Update state to stopped - user can start it manually
+            self.state_manager.update_container_state(uuid, "stopped").await.ok();
+            updated_tracker.status = "stopped".to_string();
+            self.container_tracker.save_container(&updated_tracker).await.ok();
+            self.unlock_container(uuid).await;
+            return Ok(new_container_id);
         }
 
-        // 18. Update final state - container is now stopped and ready to start
-        self.state_manager.update_container_state(uuid, "stopped").await.ok();
-        updated_tracker.status = "stopped".to_string();
+        // 18. Update final state - container is now running
+        self.state_manager.update_container_state(uuid, "running").await.ok();
+        updated_tracker.status = "running".to_string();
         self.container_tracker.save_container(&updated_tracker).await.ok();
         
         self.unlock_container(uuid).await;

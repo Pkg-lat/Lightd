@@ -14,9 +14,10 @@ use tracing::{error, info, warn};
 use crate::models::{ContainerInfo, CreateContainerRequest, PortMapping, ResourceLimits};
 use super::NetworkManager;
 
-/// Parse memory limit string (e.g., "2g", "512m") to bytes
+/// Parse memory limit string (e.g., "512M", "1024M", "2G") to bytes
 fn parse_memory_limit(limit: &str) -> anyhow::Result<i64> {
-    let limit = limit.to_lowercase();
+    let limit = limit.trim().to_lowercase();
+    
     if let Some(num_str) = limit.strip_suffix("g") {
         let num: f64 = num_str.parse()?;
         Ok((num * 1024.0 * 1024.0 * 1024.0) as i64)
@@ -27,17 +28,26 @@ fn parse_memory_limit(limit: &str) -> anyhow::Result<i64> {
         let num: f64 = num_str.parse()?;
         Ok((num * 1024.0) as i64)
     } else {
-        // Assume bytes
+        // Plain number = assume bytes (for backwards compat)
         Ok(limit.parse()?)
     }
 }
 
-/// Parse CPU limit string (e.g., "2.0", "0.5") to CPU quota
+/// Parse CPU limit string (e.g., "100", "50", "200") to CPU quota
+/// Input is percentage where 100 = 1 core
 fn parse_cpu_limit(limit: &str) -> anyhow::Result<i64> {
-    let cpu_float: f64 = limit.parse()?;
+    let limit = limit.trim();
+    
+    // Strip % suffix if present (for backwards compat)
+    let num_str = limit.strip_suffix('%').unwrap_or(limit);
+    
+    // Parse as percentage (100 = 1 core)
+    let percent: f64 = num_str.parse()?;
+    let cpu_cores = percent / 100.0;
+    
     // CPU quota is in microseconds per period (100000 microseconds = 100ms period)
     // So 1.0 CPU = 100000, 2.0 CPU = 200000, 0.5 CPU = 50000
-    Ok((cpu_float * 100000.0) as i64)
+    Ok((cpu_cores * 100000.0) as i64)
 }
 
 /// Generate environment variables for resource limits
@@ -1446,5 +1456,33 @@ impl ContainerManager {
                 Ok("Update script executed (detached)".to_string())
             }
         }
+    }
+
+    /// Send a command to the container's stdin (for interactive processes like game servers)
+    /// This writes directly to the container's stdin stream, not via exec
+    pub async fn send_stdin_command(&self, id: &str, command: &str) -> anyhow::Result<()> {
+        use bollard::container::AttachContainerOptions;
+        use tokio::io::AsyncWriteExt;
+        
+        info!("Sending stdin command to container {}: {}", id, command);
+        
+        let options = AttachContainerOptions::<String> {
+            stdin: Some(true),
+            stdout: Some(false),
+            stderr: Some(false),
+            stream: Some(true),
+            ..Default::default()
+        };
+
+        let attach_result = self.client.attach_container(id, Some(options)).await?;
+        let mut input = attach_result.input;
+        
+        // Send command with newline
+        let command_with_newline = format!("{}\n", command);
+        input.write_all(command_with_newline.as_bytes()).await?;
+        input.flush().await?;
+        
+        info!("Stdin command sent successfully to container {}", id);
+        Ok(())
     }
 }

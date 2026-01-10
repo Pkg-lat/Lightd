@@ -53,6 +53,11 @@ release-linux:
 	@echo "Building lightd for Linux (x86_64, release)..."
 	cargo build --target x86_64-unknown-linux-gnu --release
 
+.PHONY: release-linux-arm
+release-linux:
+	@echo "Building lightd for Linux (x86_64, release)..."
+	cargo zigbuild --release --target aarch64-unknown-linux-musl                                    
+
 .PHONY: check
 check:
 	@echo "🔍 Checking code..."

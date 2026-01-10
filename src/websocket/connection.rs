@@ -517,7 +517,69 @@ impl WebSocketConnection {
                         }
                         Some(Ok(Message::Text(text))) => {
                             debug!("Received client message: {}", text);
-                            // TODO: Add command handling
+                            
+                            // Parse client message
+                            if let Ok(client_msg) = serde_json::from_str::<super::WsClientMessage>(&text) {
+                                match client_msg {
+                                    super::WsClientMessage::SendCommand(args) => {
+                                        if let Some(command) = args.first() {
+                                            if current_running {
+                                                // Send command to container stdin
+                                                let manager = crate::docker::ContainerManager::new((*docker).clone());
+                                                match manager.send_stdin_command(&container_id, command).await {
+                                                    Ok(_) => {
+                                                        let _ = tx.send(Message::Text(
+                                                            WsMessage::command_sent(command).to_json()
+                                                        )).await;
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to send command to container: {}", e);
+                                                        let _ = tx.send(Message::Text(
+                                                            WsMessage::error(&format!("Failed to send command: {}", e)).to_json()
+                                                        )).await;
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = tx.send(Message::Text(
+                                                    WsMessage::error("Container is not running").to_json()
+                                                )).await;
+                                            }
+                                        }
+                                    }
+                                    super::WsClientMessage::Power(args) => {
+                                        if let Some(action) = args.first() {
+                                            info!("Power action requested via WebSocket: {} for {}", action, container_uuid);
+                                            // Power actions are handled via the async_power manager
+                                            // Client should use the REST API for power actions
+                                            let _ = tx.send(Message::Text(
+                                                WsMessage::daemon_message(&format!("Power action '{}' should be sent via REST API", action)).to_json()
+                                            )).await;
+                                        }
+                                    }
+                                    super::WsClientMessage::Ping => {
+                                        // Just a keepalive, no response needed
+                                    }
+                                }
+                            } else {
+                                // Legacy: try to parse as simple command string
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() && current_running {
+                                    let manager = crate::docker::ContainerManager::new((*docker).clone());
+                                    match manager.send_stdin_command(&container_id, trimmed).await {
+                                        Ok(_) => {
+                                            let _ = tx.send(Message::Text(
+                                                WsMessage::command_sent(trimmed).to_json()
+                                            )).await;
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to send command to container: {}", e);
+                                            let _ = tx.send(Message::Text(
+                                                WsMessage::error(&format!("Failed to send command: {}", e)).to_json()
+                                            )).await;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Some(Err(e)) => {
                             debug!("Client error: {}", e);

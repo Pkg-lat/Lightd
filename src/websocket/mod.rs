@@ -37,6 +37,23 @@ pub enum WsEvent {
     DaemonMessage,
     /// Docker event (start, stop, die, etc.)
     DockerEvent,
+    /// Command sent acknowledgment
+    CommandSent,
+}
+
+/// Client -> Server message types
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "event", content = "args")]
+pub enum WsClientMessage {
+    /// Send command to container stdin
+    #[serde(rename = "send_command")]
+    SendCommand(Vec<String>),
+    /// Power action (start, stop, restart, kill)
+    #[serde(rename = "power")]
+    Power(Vec<String>),
+    /// Ping/keepalive
+    #[serde(rename = "ping")]
+    Ping,
 }
 
 /// WebSocket message format
@@ -105,6 +122,14 @@ impl WsMessage {
         Self {
             event: WsEvent::DockerEvent,
             args: vec![action.to_string(), status.to_string()],
+        }
+    }
+
+    /// Create command sent acknowledgment
+    pub fn command_sent(command: &str) -> Self {
+        Self {
+            event: WsEvent::CommandSent,
+            args: vec![command.to_string()],
         }
     }
 

@@ -6,7 +6,6 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use bollard::container::{LogOutput, LogsOptions, StatsOptions};
-use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::system::EventsOptions;
 use chrono::{DateTime, FixedOffset};
 use futures_util::{SinkExt, StreamExt};
@@ -230,7 +229,7 @@ impl WebSocketHandler {
                             if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                                 if client_msg.event == "send_command" && !client_msg.args.is_empty() {
                                     let cmd = &client_msg.args[0];
-                                    debug!("Executing command in {}: {}", container_id, cmd);
+                                    debug!("Sending command to container stdin {}: {}", container_id, cmd);
                                     
                                     let docker_clone = docker.clone();
                                     let cid = container_id.clone();
@@ -238,7 +237,7 @@ impl WebSocketHandler {
                                     let command = cmd.clone();
                                     
                                     tokio::spawn(async move {
-                                        Self::execute_command(&docker_clone, &cid, &command, &hub).await;
+                                        Self::send_stdin_command(&docker_clone, &cid, &command, &hub).await;
                                     });
                                 }
                             }
@@ -644,59 +643,48 @@ impl WebSocketHandler {
         })
     }
 
-    async fn execute_command(
+    /// Send a command to the container's stdin (for interactive processes like game servers)
+    /// This writes directly to the container's stdin stream, not via exec
+    async fn send_stdin_command(
         docker: &bollard::Docker,
         container_id: &str,
         command: &str,
         event_hub: &ContainerEventHub,
     ) {
-        let exec_config = CreateExecOptions {
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            cmd: Some(vec!["sh", "-c", command]),
+        use bollard::container::AttachContainerOptions;
+        use tokio::io::AsyncWriteExt;
+        
+        info!("Sending stdin command to container {}: {}", container_id, command);
+        
+        let options = AttachContainerOptions::<String> {
+            stdin: Some(true),
+            stdout: Some(false),
+            stderr: Some(false),
+            stream: Some(true),
             ..Default::default()
         };
 
-        match docker.create_exec(container_id, exec_config).await {
-            Ok(exec) => {
-                match docker.start_exec(&exec.id, None).await {
-                    Ok(StartExecResults::Attached { mut output, .. }) => {
-                        while let Some(result) = output.next().await {
-                            match result {
-                                Ok(log_output) => {
-                                    let message_bytes = match log_output {
-                                        LogOutput::StdOut { message } |
-                                        LogOutput::StdErr { message } |
-                                        LogOutput::Console { message } |
-                                        LogOutput::StdIn { message } => message,
-                                    };
-
-                                    let text = String::from_utf8_lossy(&message_bytes);
-                                    for line in text.lines() {
-                                        let line = line.trim_end();
-                                        if !line.is_empty() {
-                                            event_hub.broadcast_console(container_id, line).await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Exec output error for {}: {}", container_id, e);
-                                    break;
-                                }
-                            }
+        match docker.attach_container(container_id, Some(options)).await {
+            Ok(attach_result) => {
+                let mut input = attach_result.input;
+                
+                // Send command with newline
+                let command_with_newline = format!("{}\n", command);
+                match input.write_all(command_with_newline.as_bytes()).await {
+                    Ok(_) => {
+                        if let Err(e) = input.flush().await {
+                            warn!("Failed to flush stdin for {}: {}", container_id, e);
                         }
-                    }
-                    Ok(StartExecResults::Detached) => {
-                        debug!("Exec started in detached mode for {}", container_id);
+                        info!("Stdin command sent successfully to container {}", container_id);
                     }
                     Err(e) => {
-                        error!("Failed to start exec for {}: {}", container_id, e);
-                        event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
+                        error!("Failed to write to stdin for {}: {}", container_id, e);
+                        event_hub.broadcast_console(container_id, &format!("Error sending command: {}", e)).await;
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to create exec for {}: {}", container_id, e);
+                error!("Failed to attach to container {} stdin: {}", container_id, e);
                 event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
             }
         }
