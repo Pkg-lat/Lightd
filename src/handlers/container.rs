@@ -859,12 +859,13 @@ pub async fn update_container(
     }
 }
 
-/// Run installation script in container (uses temp container pattern)
+/// Run installation script in container (uses single container approach)
+/// Returns immediately with UUID - frontend should poll status or use websocket
 pub async fn install_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateContainerRequest>,
-) -> Result<Json<ApiResponse<String>>, StatusCode> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Running installation script for container: {}", id);
     
     if let Ok(true) = check_container_suspended(&state, &id) {
@@ -895,8 +896,12 @@ pub async fn install_container(
             }
         });
         
-        // Return immediately
-        Ok(Json(ApiResponse::success(format!("Installation started for container {}", id))))
+        // Return immediately with UUID - frontend can poll status or websocket will auto-switch
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "message": format!("Installation started for container {}", id),
+            "uuid": uuid,
+            "status": "installing"
+        }))))
     } else {
         Ok(Json(ApiResponse::error("Container not found in daemon state".to_string())))
     }
@@ -947,18 +952,29 @@ pub async fn update_container_limits(
 }
 
 /// Get container installation/update status
+/// Returns current container_id which may change during reinstall
 pub async fn get_container_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<InstallationStatus>>, StatusCode> {
     info!("Getting status for container: {}", id);
     
-    // Lock-free lookup
-    if let Some((_, container_state)) = state.state_manager.find_by_container_id(&id) {
+    // Lock-free lookup - try by container ID first, then by UUID
+    if let Some((uuid, container_state)) = state.state_manager.find_by_container_id(&id) {
         let status = InstallationStatus {
             status: container_state.state.clone(),
             progress: container_state.lock_reason.clone(),
             logs: None,
+            container_id: container_state.container_id.clone(),
+        };
+        Ok(Json(ApiResponse::success(status)))
+    } else if let Some(container_state) = state.state_manager.get_container(&id) {
+        // Try as UUID
+        let status = InstallationStatus {
+            status: container_state.state.clone(),
+            progress: container_state.lock_reason.clone(),
+            logs: None,
+            container_id: container_state.container_id.clone(),
         };
         Ok(Json(ApiResponse::success(status)))
     } else {

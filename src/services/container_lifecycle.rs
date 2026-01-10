@@ -543,11 +543,19 @@ impl ContainerLifecycleManager {
         }
     }
 
-    /// Reinstall a container using temp container pattern
+    /// Reinstall a container - keeps same container to preserve installed packages
     /// 1. Stop and remove existing container
-    /// 2. Run install script in temp container (mounts same volume)
-    /// 3. Remove temp container
-    /// 4. Create new final container with startup command
+    /// 2. Create new container that runs /data/entrypoint.sh (initially contains install script)
+    /// 3. Update state manager immediately so websocket can stream logs
+    /// 4. Wait for install to complete
+    /// 5. Update /data/entrypoint.sh to startup command
+    /// 6. Restart the SAME container (preserves apk/apt installed packages)
+    /// 
+    /// This approach:
+    /// - Websocket can stream install logs because container_id is updated immediately
+    /// - After install, we update entrypoint.sh and restart same container
+    /// - Packages installed via apk/apt are preserved in the container layer
+    /// - Non-blocking - runs in background task
     pub async fn reinstall(
         &self,
         uuid: &str,
@@ -608,132 +616,14 @@ impl ContainerLifecycleManager {
         tokio::fs::create_dir_all(&data_path).await
             .map_err(|e| format!("Failed to create data dir: {}", e))?;
 
-        // 6. Write install script
-        let install_script_path = format!("{}/install.sh", data_path);
-        tokio::fs::write(&install_script_path, install_script).await
-            .map_err(|e| format!("Failed to write install script: {}", e))?;
-        
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&install_script_path, std::fs::Permissions::from_mode(0o755));
-        }
-
-        // 7. Create temp install container
-        info!("Lifecycle: Creating temp install container for {}", uuid);
-        let temp_container_name = format!("{}-reinstall-{}", uuid, chrono::Utc::now().timestamp());
-        let abs_volume_path = std::fs::canonicalize(&volume_path)
-            .map_err(|e| format!("Failed to get abs path: {}", e))?
-            .to_string_lossy()
-            .to_string();
-        let abs_data_path = std::fs::canonicalize(&data_path)
-            .map_err(|e| format!("Failed to get abs data path: {}", e))?
-            .to_string_lossy()
-            .to_string();
-
-        let temp_config = bollard::container::Config {
-            image: Some(tracker.image.clone()),
-            cmd: Some(vec!["/bin/sh".to_string(), "/data/install.sh".to_string()]),
-            working_dir: Some("/home/container".to_string()),
-            tty: Some(true),
-            env: Some(vec!["MODE=INSTALL".to_string()]),
-            host_config: Some(bollard::models::HostConfig {
-                binds: Some(vec![
-                    format!("{}:/home/container", abs_volume_path),
-                    format!("{}:/data:ro", abs_data_path),
-                ]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let temp_options = bollard::container::CreateContainerOptions {
-            name: &temp_container_name,
-            platform: None,
-        };
-
-        // Pull image first
-        manager.pull_image_if_needed(&tracker.image).await
-            .map_err(|e| format!("Failed to pull image: {}", e))?;
-
-        // Create temp container
-        let temp_response = self.docker.create_container(Some(temp_options), temp_config).await
-            .map_err(|e| format!("Failed to create temp container: {}", e))?;
-        let temp_id = temp_response.id;
-
-        info!("Lifecycle: Starting temp install container {}", temp_id);
-
-        // Start temp container
-        self.docker.start_container::<String>(&temp_id, None).await
-            .map_err(|e| format!("Failed to start temp container: {}", e))?;
-
-        // 8. Wait for install to complete
-        let max_wait = 600;
-        let mut waited = 0;
-        let mut install_success = false;
-        let mut install_timed_out = false;
-
-        info!("Lifecycle: Waiting for temp install container {} to complete", temp_id);
-
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            waited += 2;
-
-            if waited % 10 == 0 {
-                info!("Lifecycle: Still waiting for install... {}s elapsed", waited);
-            }
-
-            if waited > max_wait {
-                error!("Lifecycle: Reinstall timed out for {}", uuid);
-                install_timed_out = true;
-                let _ = self.docker.remove_container(&temp_id, Some(bollard::container::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                })).await;
-                break; // Continue to create final container instead of returning error
-            }
-
-            match self.docker.inspect_container(&temp_id, None).await {
-                Ok(info) => {
-                    if let Some(state) = info.state {
-                        let is_running = state.running.unwrap_or(false);
-                        if !is_running {
-                            let exit_code = state.exit_code.unwrap_or(-1);
-                            info!("Lifecycle: Reinstall finished with exit code {}", exit_code);
-                            install_success = exit_code == 0;
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Lifecycle: Failed to inspect temp container: {}", e);
-                    break;
-                }
-            }
-        }
-
-        // 9. Remove temp container (if not already removed due to timeout)
-        if !install_timed_out {
-            info!("Lifecycle: Removing temp install container {}", temp_id);
-            let _ = self.docker.remove_container(&temp_id, Some(bollard::container::RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            })).await;
-        }
-
-        // Track install result for final state
-        let install_failed = install_timed_out || !install_success;
-        if install_failed {
-            warn!("Lifecycle: Reinstall {} for {}, but continuing to create final container", 
-                if install_timed_out { "timed out" } else { "failed" }, uuid);
-        }
-
-        // 10. Write startup entrypoint
+        // 6. Get startup command for later
         let startup_cmd = tracker.startup_command.as_ref()
             .map(|cmd| cmd.join(" "))
             .unwrap_or_else(|| "sleep infinity".to_string());
+
+        // 7. Write entrypoint.sh with INSTALL SCRIPT (this is what container will run first)
         let entrypoint_path = format!("{}/entrypoint.sh", data_path);
-        tokio::fs::write(&entrypoint_path, &startup_cmd).await
+        tokio::fs::write(&entrypoint_path, install_script).await
             .map_err(|e| format!("Failed to write entrypoint: {}", e))?;
         
         #[cfg(unix)]
@@ -742,18 +632,25 @@ impl ContainerLifecycleManager {
             let _ = std::fs::set_permissions(&entrypoint_path, std::fs::Permissions::from_mode(0o755));
         }
 
-        // 11. Build port config from tracker's allocated_ports
+        // 8. Build port config from tracker's allocated_ports
         let ports_map: HashMap<String, String> = tracker.allocated_ports
             .iter()
             .map(|p| (p.container_port.clone(), p.host_port.clone()))
             .collect();
 
-        // 12. Create final container
-        info!("Lifecycle: Creating final container for {} after reinstall", uuid);
+        // 9. Pull image first
+        manager.pull_image_if_needed(&tracker.image).await
+            .map_err(|e| format!("Failed to pull image: {}", e))?;
+
+        // 10. Create container that runs /data/entrypoint.sh
+        // The entrypoint currently contains the install script
+        info!("Lifecycle: Creating container for {} (runs /data/entrypoint.sh)", uuid);
+        
         let create_req = crate::models::CreateContainerRequest {
             image: tracker.image.clone(),
             name: Some(tracker.name.clone()),
             description: tracker.description.clone(),
+            // Always run entrypoint.sh - we change its contents to switch between install/startup
             startup_command: Some(vec!["/bin/sh".to_string(), "/data/entrypoint.sh".to_string()]),
             env: tracker.env.clone(),
             ports: if ports_map.is_empty() { None } else { Some(ports_map) },
@@ -767,45 +664,129 @@ impl ContainerLifecycleManager {
             update_content: tracker.update_content.clone(),
         };
 
-        match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
-            Ok((new_container_id, allocations)) => {
-                info!("Lifecycle: Final container created after reinstall: {}", new_container_id);
-
-                // 13. Determine final state based on install result
-                let final_state = if install_failed {
-                    "install_failed"
-                } else {
-                    "stopped" // Container is stopped, ready to start
-                };
-
-                // 14. Update state manager with final state
-                self.state_manager.update_container_state(uuid, final_state).await.ok();
-                self.state_manager.update_container_id(uuid, &new_container_id).await.ok();
-
-                // 15. Update tracker
-                let mut updated_tracker = tracker.clone();
-                updated_tracker.container_id = new_container_id.clone();
-                updated_tracker.allocated_ports = allocations;
-                updated_tracker.status = final_state.to_string();
-                self.container_tracker.save_container(&updated_tracker).await.ok();
-
-                self.unlock_container(uuid).await;
-                
-                if install_failed {
-                    info!("Lifecycle: Reinstall for {} completed with failures - container is available for retry", uuid);
-                } else {
-                    info!("Lifecycle: Reinstall complete for {}, new ID: {}", uuid, new_container_id);
-                }
-                
-                Ok(new_container_id)
-            }
+        let (new_container_id, allocations) = match manager.create_with_networking(
+            create_req, 
+            &self.network, 
+            uuid, 
+            &self.volumes_path
+        ).await {
+            Ok(result) => result,
             Err(e) => {
-                error!("Lifecycle: Failed to create final container after reinstall: {}", e);
+                error!("Lifecycle: Failed to create container: {}", e);
                 self.state_manager.update_container_state(uuid, "failed").await.ok();
                 self.unlock_container(uuid).await;
-                Err(format!("Failed to create container: {}", e))
+                return Err(format!("Failed to create container: {}", e));
+            }
+        };
+
+        info!("Lifecycle: Container created: {}", new_container_id);
+
+        // 11. Update state manager IMMEDIATELY so websocket can find the new container
+        self.state_manager.update_container_id(uuid, &new_container_id).await.ok();
+        
+        // 12. Update tracker with new container ID
+        let mut updated_tracker = tracker.clone();
+        updated_tracker.container_id = new_container_id.clone();
+        updated_tracker.allocated_ports = allocations;
+        updated_tracker.status = "installing".to_string();
+        self.container_tracker.save_container(&updated_tracker).await.ok();
+
+        // 13. Start the container (runs install script via entrypoint.sh)
+        info!("Lifecycle: Starting container {} (running install script)", new_container_id);
+        if let Err(e) = manager.start(&new_container_id).await {
+            error!("Lifecycle: Failed to start container: {}", e);
+            self.state_manager.update_container_state(uuid, "failed").await.ok();
+            self.unlock_container(uuid).await;
+            return Err(format!("Failed to start container: {}", e));
+        }
+
+        // 14. Wait for install to complete (non-blocking poll)
+        let max_wait = 600;
+        let mut waited = 0;
+        let mut install_success = false;
+        let mut install_timed_out = false;
+
+        info!("Lifecycle: Waiting for install to complete in container {}", new_container_id);
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            waited += 2;
+
+            if waited % 10 == 0 {
+                info!("Lifecycle: Still waiting for install... {}s elapsed", waited);
+            }
+
+            if waited > max_wait {
+                error!("Lifecycle: Reinstall timed out for {}", uuid);
+                install_timed_out = true;
+                break;
+            }
+
+            match self.docker.inspect_container(&new_container_id, None).await {
+                Ok(info) => {
+                    if let Some(state) = info.state {
+                        let is_running = state.running.unwrap_or(false);
+                        if !is_running {
+                            let exit_code = state.exit_code.unwrap_or(-1);
+                            info!("Lifecycle: Install finished with exit code {}", exit_code);
+                            install_success = exit_code == 0;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Lifecycle: Failed to inspect container: {}", e);
+                    break;
+                }
             }
         }
+
+        // 15. Determine final state
+        let install_failed = install_timed_out || !install_success;
+        
+        if install_failed {
+            warn!("Lifecycle: Reinstall {} for {}", 
+                if install_timed_out { "timed out" } else { "failed" }, uuid);
+            
+            // Update state to failed but keep the container for debugging
+            self.state_manager.update_container_state(uuid, "install_failed").await.ok();
+            updated_tracker.status = "install_failed".to_string();
+            self.container_tracker.save_container(&updated_tracker).await.ok();
+            self.unlock_container(uuid).await;
+            
+            info!("Lifecycle: Reinstall for {} completed with failures - container available for retry", uuid);
+            return Ok(new_container_id);
+        }
+
+        // 16. Install succeeded! Update entrypoint.sh to startup command
+        info!("Lifecycle: Install succeeded, updating entrypoint.sh to startup command");
+        tokio::fs::write(&entrypoint_path, &startup_cmd).await
+            .map_err(|e| format!("Failed to update entrypoint: {}", e))?;
+
+        // 17. Restart the SAME container - it will now run the startup command
+        // The container preserves all installed packages (apk, apt, etc.)
+        info!("Lifecycle: Restarting container {} with startup command", new_container_id);
+        if let Err(e) = manager.start(&new_container_id).await {
+            // This is expected to fail if container is already stopped
+            // Docker restart might work better
+            warn!("Lifecycle: Start failed (trying restart): {}", e);
+            
+            // Try docker restart instead
+            if let Err(e2) = self.docker.restart_container(&new_container_id, None).await {
+                warn!("Lifecycle: Restart also failed: {}", e2);
+                // Container is stopped but ready - user can start it manually
+            }
+        }
+
+        // 18. Update final state - container is now stopped and ready to start
+        self.state_manager.update_container_state(uuid, "stopped").await.ok();
+        updated_tracker.status = "stopped".to_string();
+        self.container_tracker.save_container(&updated_tracker).await.ok();
+        
+        self.unlock_container(uuid).await;
+        
+        info!("Lifecycle: Reinstall complete for {}, container ID: {}", uuid, new_container_id);
+        Ok(new_container_id)
     }
 
     /// Swap the /home/container mount to a different volume path

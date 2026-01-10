@@ -169,6 +169,8 @@ pub struct InstallationStatus {
     pub status: String, // "installing", "updating", "ready", "failed"
     pub progress: Option<String>,
     pub logs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>, // Current container ID (may change during reinstall)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

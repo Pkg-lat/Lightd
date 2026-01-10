@@ -169,17 +169,19 @@ impl WebSocketConnection {
     }
 
     /// Main handler - keeps websocket alive as a channel
+    /// Supports container ID changes during reinstall by checking state manager
     pub async fn handle(self) {
-        let container_id = self.token.container_id.clone();
+        let mut container_id = self.token.container_id.clone();
         let container_uuid = self.token.container_uuid.clone();
         let docker = Arc::new(self.state.docker.client.clone());
+        let state_manager = self.state.state_manager.clone();
 
         info!("WebSocket channel opened for container: {} ({})", container_uuid, container_id);
 
         let (mut tx, mut rx) = self.socket.split();
 
         // Get current container status (lock-free)
-        let current_status = self.state.state_manager.get_container(&container_uuid)
+        let current_status = state_manager.get_container(&container_uuid)
             .map(|cs| cs.state.clone())
             .unwrap_or_else(|| "offline".to_string());
 
@@ -198,8 +200,10 @@ impl WebSocketConnection {
 
         const PING_INTERVAL: Duration = Duration::from_secs(30);
         const STATS_INTERVAL: Duration = Duration::from_secs(1);
+        const CONTAINER_ID_CHECK_INTERVAL: Duration = Duration::from_secs(2);
         let mut last_ping = Instant::now();
         let mut last_stats = Instant::now();
+        let mut last_container_id_check = Instant::now();
         let mut log_stream: Option<_> = None;
         let mut stats_stream: Option<_> = None;
         let mut current_running = is_running;
@@ -231,6 +235,68 @@ impl WebSocketConnection {
         loop {
             tokio::select! {
                 biased;
+
+                // Check for container ID changes (during reinstall)
+                _ = tokio::time::sleep(Duration::from_millis(100)), if last_container_id_check.elapsed() >= CONTAINER_ID_CHECK_INTERVAL => {
+                    last_container_id_check = Instant::now();
+                    
+                    // Check if container ID has changed in state manager
+                    if let Some(container_state) = state_manager.get_container(&container_uuid) {
+                        if let Some(new_container_id) = &container_state.container_id {
+                            if new_container_id != &container_id {
+                                info!("Container ID changed from {} to {} (reinstall detected)", container_id, new_container_id);
+                                container_id = new_container_id.clone();
+                                
+                                // Notify client of container ID change
+                                let _ = tx.send(Message::Text(
+                                    WsMessage::daemon_message(&format!("Container recreated, new ID: {}", &container_id[..12.min(container_id.len())])).to_json()
+                                )).await;
+                                
+                                // Reset streams - they'll be recreated when container starts
+                                log_stream = None;
+                                stats_stream = None;
+                                current_running = false;
+                                
+                                // Restart event listener for new container
+                                event_rx = Self::spawn_event_listener(docker.clone(), container_id.clone()).await;
+                                
+                                // Check if new container is already running
+                                if Self::check_initial_state(&docker, &container_id).await {
+                                    info!("New container {} is already running, starting streams", container_id);
+                                    current_running = true;
+                                    
+                                    let _ = tx.send(Message::Text(WsMessage::status("running").to_json())).await;
+                                    let _ = tx.send(Message::Text(
+                                        WsMessage::daemon_message("Container running, streaming logs...").to_json()
+                                    )).await;
+                                    
+                                    let log_options = LogsOptions::<String> {
+                                        follow: true,
+                                        stdout: true,
+                                        stderr: true,
+                                        since: docker_since(0),
+                                        timestamps: false,
+                                        ..Default::default()
+                                    };
+                                    log_stream = Some(docker.logs(&container_id, Some(log_options)));
+                                    
+                                    let stats_options = StatsOptions {
+                                        stream: true,
+                                        one_shot: false,
+                                    };
+                                    stats_stream = Some(docker.stats(&container_id, Some(stats_options)));
+                                    container_start_time = Self::get_container_start_time(&docker, &container_id).await;
+                                }
+                            }
+                        }
+                        
+                        // Also send status updates for installing/failed states
+                        let state = &container_state.state;
+                        if state == "installing" || state == "install_failed" || state == "failed" {
+                            let _ = tx.send(Message::Text(WsMessage::status(state).to_json())).await;
+                        }
+                    }
+                }
 
                 // Docker events - most efficient way to detect state changes
                 event = event_rx.recv() => {
