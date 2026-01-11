@@ -14,3 +14,14 @@ Lightd changelog rules.
 ### Fixed
 * NON
 
+## v0.2 Liberal
+
+### Added
+* Non
+
+
+### Fixed
+* Fixed Reinstallation.
+* Move away from being standalone.
+* Updated websockets to be prominent.
+

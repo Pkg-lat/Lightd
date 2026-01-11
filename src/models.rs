@@ -156,6 +156,10 @@ pub struct AttachResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateContainerRequest {
     pub update_content: String, // Shell script to run for updates
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,  // Docker image to use (overrides tracker)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_command: Option<Vec<String>>, // Startup command (overrides tracker)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

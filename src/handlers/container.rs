@@ -879,6 +879,8 @@ pub async fn install_container(
         }
         
         let install_script = req.update_content.clone();
+        let image = req.image.clone();
+        let startup_command = req.startup_command.clone();
         
         // Spawn reinstall using lifecycle manager in background
         let lifecycle = state.lifecycle.clone();
@@ -886,7 +888,7 @@ pub async fn install_container(
         
         tokio::spawn(async move {
             info!("Background: Starting reinstall for {}", uuid_clone);
-            match lifecycle.reinstall(&uuid_clone, &install_script).await {
+            match lifecycle.reinstall(&uuid_clone, &install_script, image.as_deref(), startup_command.as_ref()).await {
                 Ok(new_id) => {
                     info!("Background: Reinstall complete for {}, new container: {}", uuid_clone, new_id);
                 }

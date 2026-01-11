@@ -556,10 +556,16 @@ impl ContainerLifecycleManager {
     /// - After install, we update entrypoint.sh and restart same container
     /// - Packages installed via apk/apt are preserved in the container layer
     /// - Non-blocking - runs in background task
+    /// 
+    /// Optional parameters:
+    /// - image: Override docker image (use server's current image from MongoDB)
+    /// - startup_command: Override startup command (use server's current command from MongoDB)
     pub async fn reinstall(
         &self,
         uuid: &str,
         install_script: &str,
+        image: Option<&str>,
+        startup_command: Option<&Vec<String>>,
     ) -> Result<String, String> {
         info!("Lifecycle: Starting reinstall for UUID {}", uuid);
 
@@ -616,10 +622,16 @@ impl ContainerLifecycleManager {
         tokio::fs::create_dir_all(&data_path).await
             .map_err(|e| format!("Failed to create data dir: {}", e))?;
 
-        // 6. Get startup command for later
-        let startup_cmd = tracker.startup_command.as_ref()
+        // 6. Get startup command for later - use provided command or fall back to tracker
+        let startup_cmd = startup_command
             .map(|cmd| cmd.join(" "))
+            .or_else(|| tracker.startup_command.as_ref().map(|cmd| cmd.join(" ")))
             .unwrap_or_else(|| "sleep infinity".to_string());
+        
+        // Use provided image or fall back to tracker
+        let container_image = image.unwrap_or(&tracker.image);
+        
+        info!("Lifecycle: Using image: {}, startup: {}", container_image, startup_cmd);
 
         // 7. Write entrypoint.sh with INSTALL SCRIPT (this is what container will run first)
         let entrypoint_path = format!("{}/entrypoint.sh", data_path);
@@ -639,7 +651,7 @@ impl ContainerLifecycleManager {
             .collect();
 
         // 9. Pull image first
-        manager.pull_image_if_needed(&tracker.image).await
+        manager.pull_image_if_needed(container_image).await
             .map_err(|e| format!("Failed to pull image: {}", e))?;
 
         // 10. Create container that runs /data/entrypoint.sh
@@ -647,7 +659,7 @@ impl ContainerLifecycleManager {
         info!("Lifecycle: Creating container for {} (runs /data/entrypoint.sh)", uuid);
         
         let create_req = crate::models::CreateContainerRequest {
-            image: tracker.image.clone(),
+            image: container_image.to_string(),
             name: Some(tracker.name.clone()),
             description: tracker.description.clone(),
             // Always run entrypoint.sh - we change its contents to switch between install/startup
@@ -684,7 +696,7 @@ impl ContainerLifecycleManager {
         // 11. Update state manager IMMEDIATELY so websocket can find the new container
         self.state_manager.update_container_id(uuid, &new_container_id).await.ok();
         
-        // 12. Update tracker with new container ID
+        // 12. Update tracker with new container ID (minimal update - panel is source of truth)
         let mut updated_tracker = tracker.clone();
         updated_tracker.container_id = new_container_id.clone();
         updated_tracker.allocated_ports = allocations;
