@@ -98,11 +98,21 @@ impl Remote {
 
     /// Send install/update status
     pub async fn send_install_status(&self, container_uuid: &str, status: &str, message: Option<&str>) {
+        self.send_install_status_with_container_id(container_uuid, status, message, None).await;
+    }
+
+    /// Send install/update status with new container ID (for reinstall)
+    pub async fn send_install_status_with_container_id(&self, container_uuid: &str, status: &str, message: Option<&str>, new_container_id: Option<&str>) {
         if !self.is_enabled() {
             return;
         }
 
-        let body = json!({"container_uuid": container_uuid, "status": status, "message": message});
+        let body = json!({
+            "container_uuid": container_uuid, 
+            "status": status, 
+            "message": message,
+            "new_container_id": new_container_id
+        });
         let path = format!("/api/lightd/containers/{}/install_status", container_uuid);
         let _ = self.post(&path, body).await;
     }

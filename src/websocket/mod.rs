@@ -105,7 +105,7 @@ impl WsMessage {
     pub fn daemon_message(msg: &str) -> Self {
         Self {
             event: WsEvent::DaemonMessage,
-            args: vec!["[container@pkg.lat]: ".to_string() + msg],
+            args: vec!["[Lightd] ".to_string() + msg],
         }
     }
 

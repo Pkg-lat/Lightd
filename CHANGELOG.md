@@ -24,4 +24,6 @@ Lightd changelog rules.
 * Fixed Reinstallation.
 * Move away from being standalone.
 * Updated websockets to be prominent.
+* Updated kill to not be blocked by stop.
+*  
 

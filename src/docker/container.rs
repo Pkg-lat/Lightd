@@ -937,7 +937,14 @@ impl ContainerManager {
                     logs.push_str(&log_output.to_string());
                 }
                 Err(e) => {
-                    error!("Error reading logs: {}", e);
+                    // "bytes remaining on stream" is a known bollard issue when stream ends
+                    // Don't log as error if we already have some logs
+                    let err_str = e.to_string();
+                    if err_str.contains("bytes remaining") && !logs.is_empty() {
+                        // This is fine - we got logs, stream just ended unexpectedly
+                        break;
+                    }
+                    warn!("Error reading logs: {}", e);
                     break;
                 }
             }

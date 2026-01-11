@@ -258,8 +258,8 @@ impl ResourceMonitor {
             }
         }
 
-        info!("Collected metrics for {} containers, Total RU: {:.4}, Running: {}", 
-              containers.len(), total_ru, running_containers);
+       // info!("Collected metrics for {} containers, Total RU: {:.4}, Running: {}", 
+            //  containers.len(), total_ru, running_containers);
 
         Ok(())
     }

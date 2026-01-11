@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     docker::ContainerManager,
-    models::{ApiResponse, CreateContainerRequest, SuspendRequest, UnsuspendRequest, ContainerTracker, ResourceLimits, UpdateContainerRequest, UpdateLimitsRequest, InstallationStatus, ContainerLookupResponse},
+    models::{ApiResponse, CreateContainerRequest, SuspendRequest, UnsuspendRequest, ContainerTracker, ResourceLimits, UpdateContainerRequest, UpdateLimitsRequest, InstallationStatus, ContainerLookupResponse, StopRequest, StartRequest},
     types::AppState,
     container_tracker::ContainerTrackingManager,
     state_manager::ContainerState,
@@ -176,6 +176,7 @@ pub async fn create_container(
                 status: "created".to_string(),
                 install_content: req.install_content.clone(),
                 update_content: req.update_content.clone(),
+                runtime: None,
             };
             
             let _ = state.container_tracker.save_container(&tracker).await;
@@ -363,9 +364,11 @@ fn check_container_locked(state: &AppState, container_id: &str) -> Option<String
 }
 
 /// Start a container (non-blocking, fire and forget)
+/// Accepts optional runtime config in request body for startup detection
 pub async fn start_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<StartRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Received start request for container: {}", id);
     
@@ -385,6 +388,21 @@ pub async fn start_container(
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
     
+    // First check if runtime was passed in request body
+    if let Some(Json(req)) = body {
+        if let Some(ref runtime) = req.runtime {
+            info!("Using runtime from request: start_up='{}', stop='{}'", runtime.start_up, runtime.stop);
+            state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
+        }
+    } else {
+        // Fall back to loading runtime config from tracker
+        if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+            if let Some(ref runtime) = tracker.runtime {
+                state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
+            }
+        }
+    }
+    
     match state.async_power.start(id.clone(), uuid.clone()).await {
         Ok(_) => {
             Ok(Json(ApiResponse::success(serde_json::json!({
@@ -397,9 +415,11 @@ pub async fn start_container(
 }
 
 /// Stop a container (non-blocking, fire and forget)
+/// Accepts optional runtime config in request body for graceful stop command
 pub async fn stop_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<StopRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Received stop request for container: {}", id);
     
@@ -410,6 +430,21 @@ pub async fn stop_container(
     
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
+    
+    // First check if runtime was passed in request body
+    if let Some(Json(req)) = body {
+        if let Some(ref runtime) = req.runtime {
+            info!("Using runtime from request: stop='{}', start_up='{}'", runtime.stop, runtime.start_up);
+            state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
+        }
+    } else {
+        // Fall back to loading runtime config from tracker
+        if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+            if let Some(ref runtime) = tracker.runtime {
+                state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
+            }
+        }
+    }
     
     match state.async_power.stop(id.clone(), uuid.clone()).await {
         Ok(_) => {
@@ -469,6 +504,13 @@ pub async fn restart_container(
     
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
+    
+    // Load runtime config from tracker and set it on async_power
+    if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+        if let Some(ref runtime) = tracker.runtime {
+            state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
+        }
+    }
     
     match state.async_power.restart(id.clone(), uuid.clone()).await {
         Ok(_) => {
@@ -860,7 +902,7 @@ pub async fn update_container(
 }
 
 /// Run installation script in container (uses single container approach)
-/// Returns immediately with UUID - frontend should poll status or use websocket
+/// Returns immediately - panel is notified via callback when complete
 pub async fn install_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -882,23 +924,38 @@ pub async fn install_container(
         let image = req.image.clone();
         let startup_command = req.startup_command.clone();
         
-        // Spawn reinstall using lifecycle manager in background
+        // Spawn reinstall in background with callback to panel
         let lifecycle = state.lifecycle.clone();
+        let remote = state.remote.clone();
         let uuid_clone = uuid.clone();
         
         tokio::spawn(async move {
             info!("Background: Starting reinstall for {}", uuid_clone);
+            
+            // Notify panel that install is starting
+            if let Some(ref remote) = remote {
+                remote.send_install_status(&uuid_clone, "installing", None).await;
+            }
+            
             match lifecycle.reinstall(&uuid_clone, &install_script, image.as_deref(), startup_command.as_ref()).await {
                 Ok(new_id) => {
                     info!("Background: Reinstall complete for {}, new container: {}", uuid_clone, new_id);
+                    // Notify panel of success
+                    if let Some(ref remote) = remote {
+                        remote.send_install_status(&uuid_clone, "install_success", None).await;
+                    }
                 }
                 Err(e) => {
                     error!("Background: Reinstall failed for {}: {}", uuid_clone, e);
+                    // Notify panel of failure
+                    if let Some(ref remote) = remote {
+                        remote.send_install_status(&uuid_clone, "install_failed", Some(&e)).await;
+                    }
                 }
             }
         });
         
-        // Return immediately with UUID - frontend can poll status or websocket will auto-switch
+        // Return immediately - panel will be notified via callback
         Ok(Json(ApiResponse::success(serde_json::json!({
             "message": format!("Installation started for container {}", id),
             "uuid": uuid,
@@ -1056,10 +1113,11 @@ pub async fn get_container_by_uuid(
 pub async fn start_container_by_uuid(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
+    body: Option<Json<StartRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Starting container by UUID: {}", uuid);
     match resolve_container_id(&state, &uuid) {
-        Ok(container_id) => start_container(State(state), Path(container_id)).await,
+        Ok(container_id) => start_container(State(state), Path(container_id), body).await,
         Err(e) => Ok(Json(ApiResponse::error(e))),
     }
 }
@@ -1068,10 +1126,11 @@ pub async fn start_container_by_uuid(
 pub async fn stop_container_by_uuid(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
+    body: Option<Json<StopRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Stopping container by UUID: {}", uuid);
     match resolve_container_id(&state, &uuid) {
-        Ok(container_id) => stop_container(State(state), Path(container_id)).await,
+        Ok(container_id) => stop_container(State(state), Path(container_id), body).await,
         Err(e) => Ok(Json(ApiResponse::error(e))),
     }
 }
@@ -1332,4 +1391,327 @@ pub async fn force_unlock_container(
         "status": "ok",
         "message": format!("Container {} unlocked", uuid),
     }))))
+}
+
+
+/// Reinstall a container - proper Pterodactyl-style flow
+/// 
+/// Flow:
+/// 1. Callback → INSTALLING
+/// 2. Stop and remove old container
+/// 3. Pull image
+/// 4. Create new container with bindings
+/// 5. Mount volume, run install script
+/// 6. After install exits → update entrypoint to startup command
+/// 7. Callback → READY
+/// 
+/// Panel is source of truth - Lightd just executes and reports back.
+/// This is SYNCHRONOUS - creates new container and returns new ID immediately.
+/// Install script runs in background after container is created.
+pub async fn reinstall_container(
+    State(state): State<AppState>,
+    Path(uuid): Path<String>,
+    Json(req): Json<crate::models::ReinstallRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
+    info!("Reinstall request for container: {}", uuid);
+    
+    // Check if container exists
+    let container_state = match state.state_manager.get_container(&uuid) {
+        Some(cs) => cs,
+        None => return Ok(Json(ApiResponse::error("Container not found".to_string()))),
+    };
+    
+    // Check if locked
+    if container_state.locked.unwrap_or(false) {
+        return Ok(Json(ApiResponse::error("Container is currently locked".to_string())));
+    }
+    
+    // Check if suspended
+    if state.state_manager.is_container_suspended(&uuid) {
+        return Ok(Json(ApiResponse::error("Cannot reinstall suspended container".to_string())));
+    }
+    
+    // Lock immediately
+    if let Err(e) = state.state_manager.lock_container(&uuid, "Reinstalling").await {
+        return Ok(Json(ApiResponse::error(format!("Failed to lock: {}", e))));
+    }
+    
+    // Set state to installing
+    state.state_manager.update_container_state(&uuid, "installing").await.ok();
+    
+    // SYNCHRONOUS: Create new container and get new ID
+    let new_container_id = match create_reinstall_container(
+        &uuid,
+        &req,
+        &state.docker,
+        &state.network,
+        &state.state_manager,
+        &state.container_tracker,
+        &state.config.storage.volumes_path,
+    ).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Reinstall failed for {}: {}", uuid, e);
+            state.state_manager.update_container_state(&uuid, "install_failed").await.ok();
+            state.state_manager.unlock_container(&uuid).await.ok();
+            return Ok(Json(ApiResponse::error(e)));
+        }
+    };
+    
+    info!("Reinstall: New container created: {} for {}", new_container_id, uuid);
+    
+    // Spawn background task to run install script and startup
+    let remote = state.remote.clone();
+    let state_manager = state.state_manager.clone();
+    let docker = state.docker.clone();
+    let uuid_clone = uuid.clone();
+    let new_cid = new_container_id.clone();
+    let startup_command = req.startup_command.clone();
+    let volumes_path = state.config.storage.volumes_path.clone();
+    
+    tokio::spawn(async move {
+        // Run install script and startup in background
+        let result = run_install_and_startup(
+            &uuid_clone,
+            &new_cid,
+            &startup_command,
+            &docker,
+            &state_manager,
+            &volumes_path,
+        ).await;
+        
+        match result {
+            Ok(_) => {
+                info!("Reinstall complete for {}", uuid_clone);
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_success", None).await;
+                }
+                state_manager.unlock_container(&uuid_clone).await.ok();
+            }
+            Err(e) => {
+                error!("Reinstall install phase failed for {}: {}", uuid_clone, e);
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_failed", Some(&e)).await;
+                }
+                state_manager.update_container_state(&uuid_clone, "install_failed").await.ok();
+                state_manager.unlock_container(&uuid_clone).await.ok();
+            }
+        }
+    });
+    
+    // Return immediately with new container ID
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "status": "installing",
+        "message": format!("Reinstall started for container {}", uuid),
+        "uuid": uuid,
+        "new_container_id": new_container_id,
+    }))))
+}
+
+/// Create new container for reinstall (synchronous part)
+/// Returns new container ID immediately
+async fn create_reinstall_container(
+    uuid: &str,
+    req: &crate::models::ReinstallRequest,
+    docker: &std::sync::Arc<crate::docker::DockerClient>,
+    network: &std::sync::Arc<tokio::sync::RwLock<crate::docker::NetworkManager>>,
+    state_manager: &std::sync::Arc<crate::state_manager::StateManager>,
+    container_tracker: &std::sync::Arc<crate::container_tracker::ContainerTrackingManager>,
+    volumes_path: &str,
+) -> Result<String, String> {
+    let manager = ContainerManager::new(docker.client.clone());
+    
+    // Load existing tracker for port allocations and other config
+    let tracker = container_tracker.get_container(uuid).await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Container tracker not found".to_string())?;
+    
+    let old_container_id = tracker.container_id.clone();
+    
+    // Step 1: Stop old container
+    info!("Reinstall: Stopping old container {}", old_container_id);
+    let _ = manager.stop(&old_container_id).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    
+    // Step 2: Remove old container
+    info!("Reinstall: Removing old container {}", old_container_id);
+    let _ = manager.remove(&old_container_id).await;
+    
+    // Step 3: Release old ports
+    {
+        let mut net_mgr = network.write().await;
+        for alloc in &tracker.allocated_ports {
+            if let Ok(port) = alloc.host_port.parse::<u16>() {
+                net_mgr.release_port(port);
+            }
+        }
+    }
+    
+    // Step 4: Pull image
+    info!("Reinstall: Pulling image {}", req.image);
+    manager.pull_image_if_needed(&req.image).await
+        .map_err(|e| format!("Failed to pull image: {}", e))?;
+    
+    // Step 5: Setup paths and write install script
+    let data_path = format!("{}/{}_data", volumes_path, uuid);
+    let entrypoint_path = format!("{}/entrypoint.sh", data_path);
+    
+    tokio::fs::create_dir_all(&data_path).await
+        .map_err(|e| format!("Failed to create data dir: {}", e))?;
+    
+    // Write install script to entrypoint
+    tokio::fs::write(&entrypoint_path, &req.install_script).await
+        .map_err(|e| format!("Failed to write install script: {}", e))?;
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&entrypoint_path, std::fs::Permissions::from_mode(0o755));
+    }
+    
+    // Step 6: Build port map (reuse existing allocations)
+    let ports_map: std::collections::HashMap<String, String> = tracker.allocated_ports
+        .iter()
+        .map(|p| (p.container_port.clone(), p.host_port.clone()))
+        .collect();
+    
+    // Step 7: Create new container
+    info!("Reinstall: Creating new container for {}", uuid);
+    let create_req = crate::models::CreateContainerRequest {
+        image: req.image.clone(),
+        name: Some(tracker.name.clone()),
+        description: tracker.description.clone(),
+        startup_command: Some(vec!["/bin/sh".to_string(), "/data/entrypoint.sh".to_string()]),
+        env: req.env.clone().or(tracker.env.clone()),
+        ports: if ports_map.is_empty() { req.ports.clone() } else { Some(ports_map) },
+        volumes: None,
+        command: None,
+        working_dir: None,
+        restart_policy: None,
+        custom_uuid: Some(uuid.to_string()),
+        limits: req.limits.clone().or(Some(tracker.limits.clone())),
+        install_content: None,
+        update_content: None,
+    };
+    
+    let (new_container_id, allocations) = manager.create_with_networking(
+        create_req,
+        network,
+        uuid,
+        volumes_path,
+    ).await.map_err(|e| format!("Failed to create container: {}", e))?;
+    
+    // Step 8: Update tracker with new container ID
+    let mut updated_tracker = tracker.clone();
+    updated_tracker.container_id = new_container_id.clone();
+    updated_tracker.allocated_ports = allocations;
+    updated_tracker.image = req.image.clone();
+    updated_tracker.startup_command = Some(req.startup_command.clone());
+    updated_tracker.runtime = req.runtime.clone();
+    container_tracker.save_container(&updated_tracker).await.ok();
+    
+    // Update state manager with new container ID
+    state_manager.update_container_id(uuid, &new_container_id).await.ok();
+    
+    Ok(new_container_id)
+}
+
+/// Run install script and startup (background part)
+async fn run_install_and_startup(
+    uuid: &str,
+    container_id: &str,
+    startup_command: &[String],
+    docker: &std::sync::Arc<crate::docker::DockerClient>,
+    state_manager: &std::sync::Arc<crate::state_manager::StateManager>,
+    volumes_path: &str,
+) -> Result<(), String> {
+    let manager = ContainerManager::new(docker.client.clone());
+    
+    // Start container (runs install script)
+    info!("Reinstall: Starting container to run install script");
+    manager.start(container_id).await
+        .map_err(|e| format!("Failed to start container: {}", e))?;
+    
+    // Wait for install to complete (max 10 min)
+    let install_success = wait_for_container_exit(&docker.client, container_id, 600).await;
+    
+    if !install_success {
+        return Err("Install script failed or timed out".to_string());
+    }
+    
+    // Write startup command to entrypoint
+    info!("Reinstall: Install complete, writing startup command");
+    let data_path = format!("{}/{}_data", volumes_path, uuid);
+    let entrypoint_path = format!("{}/entrypoint.sh", data_path);
+    
+    // Extract actual command from ["sh", "-c", "actual command"]
+    let startup_cmd = if startup_command.len() >= 3 
+        && (startup_command[0] == "sh" || startup_command[0] == "/bin/sh") 
+        && startup_command[1] == "-c" 
+    {
+        startup_command[2..].join(" ")
+    } else {
+        startup_command.join(" ")
+    };
+    
+    tokio::fs::write(&entrypoint_path, &startup_cmd).await
+        .map_err(|e| format!("Failed to write startup command: {}", e))?;
+    
+    // Start container with startup command
+    info!("Reinstall: Starting container with startup command");
+    if let Err(e) = manager.start(container_id).await {
+        warn!("Reinstall: Failed to start with startup command: {}", e);
+        state_manager.update_container_state(uuid, "stopped").await.ok();
+    } else {
+        state_manager.update_container_state(uuid, "running").await.ok();
+    }
+    
+    Ok(())
+}
+
+/// Execute the actual reinstall process (legacy - kept for reference)
+#[allow(dead_code)]
+async fn execute_reinstall(
+    uuid: &str,
+    req: &crate::models::ReinstallRequest,
+    docker: &std::sync::Arc<crate::docker::DockerClient>,
+    network: &std::sync::Arc<tokio::sync::RwLock<crate::docker::NetworkManager>>,
+    state_manager: &std::sync::Arc<crate::state_manager::StateManager>,
+    container_tracker: &std::sync::Arc<crate::container_tracker::ContainerTrackingManager>,
+    volumes_path: &str,
+) -> Result<String, String> {
+    let new_container_id = create_reinstall_container(uuid, req, docker, network, state_manager, container_tracker, volumes_path).await?;
+    run_install_and_startup(uuid, &new_container_id, &req.startup_command, docker, state_manager, volumes_path).await?;
+    Ok(new_container_id)
+}
+
+/// Wait for container to exit (install script completion)
+async fn wait_for_container_exit(docker: &bollard::Docker, container_id: &str, timeout_secs: u64) -> bool {
+    let mut waited = 0u64;
+    
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        waited += 2;
+        
+        if waited > timeout_secs {
+            error!("Container {} timed out after {}s", container_id, timeout_secs);
+            return false;
+        }
+        
+        match docker.inspect_container(container_id, None).await {
+            Ok(info) => {
+                if let Some(state) = info.state {
+                    if state.running != Some(true) {
+                        let exit_code = state.exit_code.unwrap_or(-1);
+                        info!("Container exited with code {}", exit_code);
+                        return exit_code == 0;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to inspect container: {}", e);
+                return false;
+            }
+        }
+    }
 }

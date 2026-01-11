@@ -47,6 +47,9 @@ pub struct ContainerTracker {
     pub status: String,
     pub install_content: Option<String>,
     pub update_content: Option<String>,
+    /// Runtime config for state detection (stop command, startup log detection)
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -309,4 +312,55 @@ pub struct UpdateConfigRequest {
     pub ports: Option<HashMap<String, String>>,
     pub image: Option<String>,
     pub startup_command: Option<Vec<String>>,
+}
+
+/// Runtime configuration for detecting server state
+/// Matches the software JSON runtime field
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RuntimeConfig {
+    /// Log string that indicates server has started (e.g., "Minecraft server started.")
+    #[serde(rename = "start-up", default)]
+    pub start_up: String,
+    /// Command to send to stdin for graceful stop (e.g., "stop")
+    #[serde(default)]
+    pub stop: String,
+}
+
+/// Full reinstall request - panel sends everything needed
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReinstallRequest {
+    /// Docker image to use
+    pub image: String,
+    /// Install script content
+    pub install_script: String,
+    /// Startup command (e.g., ["sh", "-c", "java -jar server.jar"])
+    pub startup_command: Vec<String>,
+    /// Environment variables
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    /// Port bindings (container_port -> host_port or "auto")
+    #[serde(default)]
+    pub ports: Option<HashMap<String, String>>,
+    /// Resource limits
+    #[serde(default)]
+    pub limits: Option<ResourceLimits>,
+    /// Runtime config for state detection
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+}
+
+/// Request for stop action with optional runtime config
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StopRequest {
+    /// Runtime config for graceful stop (stop command to send to stdin)
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+}
+
+/// Request for start action with optional runtime config
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StartRequest {
+    /// Runtime config for startup detection
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
 }

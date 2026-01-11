@@ -496,15 +496,10 @@ Lightd Daemon v{}
     
     info!("Power executor initialized on dedicated thread");
 
-    // Initialize event hub and async power manager
+    // Initialize event hub
     let event_hub = Arc::new(ContainerEventHub::new());
     
-    let async_power = Arc::new(AsyncPowerManager::new(
-        Arc::new(docker_arc.client.clone()),
-        event_hub.clone(),
-    ));
-    
-    info!("Container event hub and async power manager initialized");
+    info!("Container event hub initialized");
 
     // Initialize container lifecycle manager for stateless container recreation
     let network_arc = Arc::new(RwLock::new(network));
@@ -522,6 +517,14 @@ Lightd Daemon v{}
     let remote_client = Arc::new(crate::remote::Remote::new(
         config.monitoring.as_ref().and_then(|m| m.remote.clone()),
     ));
+
+    // Initialize async power manager with remote client for callbacks
+    let async_power = Arc::new(AsyncPowerManager::new(
+        Arc::new(docker_arc.client.clone()),
+        event_hub.clone(),
+    ).with_remote(remote_client.clone()));
+    
+    info!("Async power manager initialized with panel callbacks");
 
     // Initialize firewall manager
     let firewall_manager = Arc::new(firewall::FirewallManager::new().await);
@@ -565,6 +568,7 @@ Lightd Daemon v{}
         .route("/containers/:id/debug", get(handlers::container::debug_container))
         .route("/containers/:id/update", post(handlers::container::update_container))
         .route("/containers/:id/install", post(handlers::container::install_container))
+        .route("/containers/:id/reinstall", post(handlers::container::reinstall_container))
         .route("/containers/:id/limits", put(handlers::container::update_container_limits))
         .route("/containers/:id/status", get(handlers::container::get_container_status))
         .route("/containers/:id/pending-action", get(handlers::container::get_container_pending_action))
