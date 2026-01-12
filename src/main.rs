@@ -530,6 +530,20 @@ Lightd Daemon v{}
     let firewall_manager = Arc::new(firewall::FirewallManager::new().await);
     info!("Firewall manager initialized (iptables available: {})", firewall_manager.is_available());
 
+    // Initialize file token store for direct upload/download
+    let file_tokens = Arc::new(handlers::filesystem::FileTokenStore::new());
+    
+    // Start file token cleanup task
+    let file_tokens_clone = file_tokens.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            file_tokens_clone.cleanup_expired().await;
+        }
+    });
+    info!("File token store initialized for direct upload/download");
+
     let state = AppState {
         docker: docker_arc,
         config: Arc::new(config.clone()),
@@ -546,6 +560,7 @@ Lightd Daemon v{}
         lifecycle,
         remote: Some(remote_client),
         firewall: firewall_manager,
+        file_tokens,
     };
 
     let app = Router::new()
@@ -597,6 +612,9 @@ Lightd Daemon v{}
         .route("/containers/:id/files/unzip", post(handlers::filesystem::extract_zip))
         .route("/containers/:id/files/copy", post(handlers::filesystem::copy_file))
         .route("/containers/:id/files/upload", post(handlers::filesystem::upload_file))
+        // Direct upload/download token generation (requires auth)
+        .route("/containers/:id/files/upload-token", post(handlers::filesystem::generate_upload_token))
+        .route("/containers/:id/files/download-token", post(handlers::filesystem::generate_download_token))
         // Network management routes
         .route("/network/ports", get(handlers::network::get_available_ports))
         .route("/network/allocations", get(handlers::network::get_all_port_allocations))
@@ -653,10 +671,21 @@ Lightd Daemon v{}
             AuthState::new(config.authorization.clone()),
             auth_middleware,
         ))
+        .with_state(state.clone());
+
+    // Public routes (no auth required) - for direct file upload/download with tokens
+    let public_routes = Router::new()
+        .route("/api/public/upload", post(handlers::filesystem::public_upload))
+        .route("/api/public/download", get(handlers::filesystem::public_download))
+        .layer(CorsLayer::permissive())
         .with_state(state);
+
+    // Merge authenticated and public routes
+    let app = app.merge(public_routes);
 
     if config.authorization.enabled {
         info!("Authorization is ENABLED - all routes require valid Bearer token");
+        info!("Public routes (/api/public/*) use one-time tokens instead");
     } else {
         info!("Authorization is DISABLED - all routes are publicly accessible");
     }

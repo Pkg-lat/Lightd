@@ -46,6 +46,12 @@ fn default_version() -> String {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Fully qualified domain name for generating direct URLs (e.g., "lightd.example.com")
+    #[serde(default)]
+    pub fqdn: Option<String>,
+    /// Whether to use HTTPS for direct URLs
+    #[serde(default)]
+    pub https: Option<bool>,
     /// Number of worker threads for the async runtime (default: number of CPU cores * 2)
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
