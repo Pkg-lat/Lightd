@@ -23,7 +23,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Network manager still needs RwLock for port allocation mutations
     pub network: Arc<RwLock<NetworkManager>>,
-    pub network_config: Arc<NetworkConfig>,
+    pub network_config: Arc<RwLock<NetworkConfig>>,
     pub container_tracker: Arc<ContainerTrackingManager>,
     /// State manager is now lock-free internally (uses DashMap)
     pub state_manager: Arc<StateManager>,

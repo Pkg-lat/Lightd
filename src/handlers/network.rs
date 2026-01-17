@@ -45,6 +45,27 @@ pub struct UpdatePortRequest {
     pub host_ip: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkPortRequest {
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkPortResponse {
+    pub success: bool,
+    pub message: String,
+    pub ports_affected: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortPoolInfo {
+    pub total_available: usize,
+    pub reserved_ports: Vec<u16>,
+    pub allocated_ports: usize,
+    pub unallocated_ports: usize,
+    pub available_ports_sample: Vec<u16>, // First 20 available ports
+}
+
 #[derive(Debug, Serialize)]
 pub struct NetworkInfo {
     pub container_id: String,
@@ -109,14 +130,19 @@ pub async fn get_available_ports(
     
     let net_mgr = state.network.read().await;
     let allocated = net_mgr.get_allocated_ports();
-    
-    // Get port range from network config
     let port_range = net_mgr.get_port_range();
+    drop(net_mgr);
     
     // Get available ports from network config
-    let available: Vec<u16> = (port_range.0..port_range.1)
+    let net_config = state.network_config.read().await;
+    let all_available = net_config.get_available_ports();
+    
+    // Filter out allocated ports
+    let available: Vec<u16> = all_available
+        .iter()
         .filter(|p| !allocated.contains_key(p))
-        .take(100) // Return up to 100 available ports
+        .take(100)
+        .copied()
         .collect();
     
     let response = AvailablePortsResponse {
@@ -475,4 +501,119 @@ pub async fn apply_port_changes(
         "status": "accepted",
         "message": format!("Port changes being applied for container {}", uuid),
     }))))
+}
+
+/// Get port pool information
+pub async fn get_port_pool_info(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<PortPoolInfo>>, StatusCode> {
+    info!("Getting port pool information");
+    
+    let net_config = state.network_config.read().await;
+    let net_mgr = state.network.read().await;
+    let allocated = net_mgr.get_allocated_ports();
+    
+    let all_available = net_config.get_available_ports();
+    let total_available = all_available.len();
+    let allocated_count = allocated.len();
+    
+    // Get sample of unallocated ports
+    let unallocated: Vec<u16> = all_available
+        .iter()
+        .filter(|p| !allocated.contains_key(p))
+        .take(20)
+        .copied()
+        .collect();
+    
+    let unallocated_count = all_available
+        .iter()
+        .filter(|p| !allocated.contains_key(p))
+        .count();
+    
+    let info = PortPoolInfo {
+        total_available,
+        reserved_ports: net_config.ports.reserved_ports.clone(),
+        allocated_ports: allocated_count,
+        unallocated_ports: unallocated_count,
+        available_ports_sample: unallocated,
+    };
+    
+    Ok(Json(ApiResponse::success(info)))
+}
+
+/// Bulk add ports to the available pool
+/// POST /network/ports/add
+/// Body: { "ports": [8000, 8001, 8002] }
+pub async fn bulk_add_ports(
+    State(state): State<AppState>,
+    Json(req): Json<BulkPortRequest>,
+) -> Result<Json<ApiResponse<BulkPortResponse>>, StatusCode> {
+    info!("Bulk adding {} ports to allocation pool", req.ports.len());
+    
+    if req.ports.is_empty() {
+        return Ok(Json(ApiResponse::error("No ports provided".to_string())));
+    }
+    
+    let mut net_config = state.network_config.write().await;
+    
+    match net_config.add_ports(req.ports.clone()).await {
+        Ok(added) => {
+            info!("Successfully added {} ports", added);
+            Ok(Json(ApiResponse::success(BulkPortResponse {
+                success: true,
+                message: format!("Added {} ports to allocation pool", added),
+                ports_affected: added,
+            })))
+        }
+        Err(e) => {
+            error!("Failed to add ports: {}", e);
+            Ok(Json(ApiResponse::error(e.to_string())))
+        }
+    }
+}
+
+/// Bulk remove ports from the available pool
+/// POST /network/ports/remove
+/// Body: { "ports": [8000, 8001, 8002] }
+pub async fn bulk_remove_ports(
+    State(state): State<AppState>,
+    Json(req): Json<BulkPortRequest>,
+) -> Result<Json<ApiResponse<BulkPortResponse>>, StatusCode> {
+    info!("Bulk removing {} ports from allocation pool", req.ports.len());
+    
+    if req.ports.is_empty() {
+        return Ok(Json(ApiResponse::error("No ports provided".to_string())));
+    }
+    
+    // Check if any ports are currently allocated
+    let net_mgr = state.network.read().await;
+    let allocated = net_mgr.get_allocated_ports();
+    let allocated_ports: Vec<u16> = req.ports.iter()
+        .filter(|&&p| allocated.contains_key(&p))
+        .copied()
+        .collect();
+    drop(net_mgr);
+    
+    if !allocated_ports.is_empty() {
+        return Ok(Json(ApiResponse::error(format!(
+            "Cannot remove currently allocated ports: {:?}", allocated_ports
+        ))));
+    }
+    
+    let mut net_config = state.network_config.write().await;
+    
+    match net_config.remove_ports(req.ports.clone()).await {
+        Ok(removed) => {
+            info!("Successfully removed {} ports", removed);
+            Ok(Json(ApiResponse::success(BulkPortResponse {
+                success: true,
+                message: format!("Removed {} ports from allocation pool", removed),
+                ports_affected: removed,
+            })))
+        }
+        Err(e) => {
+            error!("Failed to remove ports: {}", e);
+            Ok(Json(ApiResponse::error(e.to_string())))
+        }
+    }
 }

@@ -548,7 +548,7 @@ Lightd Daemon v{}
         docker: docker_arc,
         config: Arc::new(config.clone()),
         network: network_arc,
-        network_config: Arc::new(network_config.clone()),
+        network_config: Arc::new(RwLock::new(network_config.clone())),
         container_tracker: container_tracker_arc,
         state_manager,
         resource_monitor,
@@ -617,6 +617,9 @@ Lightd Daemon v{}
         .route("/containers/:id/files/download-token", post(handlers::filesystem::generate_download_token))
         // Network management routes
         .route("/network/ports", get(handlers::network::get_available_ports))
+        .route("/network/ports/pool", get(handlers::network::get_port_pool_info))
+        .route("/network/ports/add", post(handlers::network::bulk_add_ports))
+        .route("/network/ports/remove", post(handlers::network::bulk_remove_ports))
         .route("/network/allocations", get(handlers::network::get_all_port_allocations))
         .route("/containers/:id/network", get(handlers::network::get_container_network))
         .route("/containers/:id/network/ports", post(handlers::network::add_port_binding))

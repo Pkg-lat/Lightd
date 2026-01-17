@@ -18,8 +18,6 @@ pub struct NetworkSettings {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PortSettings {
     pub available_ports: Vec<u16>,
-    pub range_start: u16,
-    pub range_end: u16,
     pub default_host_ip: String,
     pub reserved_ports: Vec<u16>,
 }
@@ -56,23 +54,29 @@ impl NetworkConfig {
         &self.ports.available_ports
     }
 
-    pub async fn allocate_port(&mut self, port: u16) -> anyhow::Result<()> {
-        if let Some(index) = self.ports.available_ports.iter().position(|&p| p == port) {
-            self.ports.available_ports.remove(index);
-            self.save("network.json").await?;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Port {} not available", port))
+    pub async fn add_ports(&mut self, ports: Vec<u16>) -> anyhow::Result<usize> {
+        let mut added = 0;
+        for port in ports {
+            if self.is_port_reserved(port) {
+                warn!("Skipping reserved port: {}", port);
+                continue;
+            }
+            if !self.ports.available_ports.contains(&port) {
+                self.ports.available_ports.push(port);
+                added += 1;
+            }
         }
+        self.ports.available_ports.sort();
+        self.save("network.json").await?;
+        Ok(added)
     }
 
-    pub async fn release_port(&mut self, port: u16) -> anyhow::Result<()> {
-        if !self.ports.available_ports.contains(&port) {
-            self.ports.available_ports.push(port);
-            self.ports.available_ports.sort();
-            self.save("network.json").await?;
-        }
-        Ok(())
+    pub async fn remove_ports(&mut self, ports: Vec<u16>) -> anyhow::Result<usize> {
+        let initial_len = self.ports.available_ports.len();
+        self.ports.available_ports.retain(|p| !ports.contains(p));
+        let removed = initial_len - self.ports.available_ports.len();
+        self.save("network.json").await?;
+        Ok(removed)
     }
 }
 
@@ -86,8 +90,6 @@ impl Default for NetworkConfig {
             },
             ports: PortSettings {
                 available_ports: (9001..=9050).collect(),
-                range_start: 9000,
-                range_end: 19999,
                 default_host_ip: "0.0.0.0".to_string(),
                 reserved_ports: vec![22, 80, 443, 3000, 8080],
             },
