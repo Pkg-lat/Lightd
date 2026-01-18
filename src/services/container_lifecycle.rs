@@ -38,6 +38,7 @@ pub struct ContainerLifecycleManager {
     container_tracker: Arc<ContainerTrackingManager>,
     network: Arc<RwLock<NetworkManager>>,
     volumes_path: String,
+    remote: Option<Arc<crate::remote::Remote>>,
 }
 
 impl ContainerLifecycleManager {
@@ -47,6 +48,7 @@ impl ContainerLifecycleManager {
         container_tracker: Arc<ContainerTrackingManager>,
         network: Arc<RwLock<NetworkManager>>,
         volumes_path: String,
+        remote: Option<Arc<crate::remote::Remote>>,
     ) -> Self {
         Self {
             docker,
@@ -54,6 +56,7 @@ impl ContainerLifecycleManager {
             container_tracker,
             network,
             volumes_path,
+            remote,
         }
     }
 
@@ -72,6 +75,11 @@ impl ContainerLifecycleManager {
             .map_err(|e| format!("Failed to lock container: {}", e))?;
         self.state_manager.update_container_state(uuid, "recreating").await
             .map_err(|e| format!("Failed to update state: {}", e))?;
+
+        // Notify remote panel that server is locked during recreation
+        if let Some(ref remote) = self.remote {
+            remote.send_install_status(uuid, "recreating", Some("Container recreation in progress")).await;
+        }
 
         // 2. Load current tracker data
         let tracker = match self.container_tracker.get_container(uuid).await {
@@ -151,8 +159,7 @@ impl ContainerLifecycleManager {
             restart_policy: None,
             custom_uuid: Some(uuid.to_string()),
             limits: new_limits,
-            install_content: None, // Don't re-run install
-            update_content: tracker.update_content.clone(),
+            install_content: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -181,6 +188,12 @@ impl ContainerLifecycleManager {
 
                 // 11. Unlock
                 self.unlock_container(uuid).await;
+                
+                // Notify remote panel that recreation succeeded
+                if let Some(ref remote) = self.remote {
+                    remote.send_install_status(uuid, "install_success", Some("Container recreated successfully")).await;
+                }
+                
                 info!("Lifecycle: Container {} recreation complete, new ID: {}", uuid, new_container_id);
                 Ok(new_container_id)
             }
@@ -188,6 +201,12 @@ impl ContainerLifecycleManager {
                 error!("Lifecycle: Failed to create container: {}", e);
                 let _ = self.state_manager.update_container_state(uuid, "failed").await;
                 self.unlock_container(uuid).await;
+                
+                // Notify remote panel that recreation failed
+                if let Some(ref remote) = self.remote {
+                    remote.send_install_status(uuid, "install_failed", Some(&format!("Container recreation failed: {}", e))).await;
+                }
+                
                 Err(format!("Failed to create container: {}", e))
             }
         }
@@ -245,7 +264,7 @@ impl ContainerLifecycleManager {
         }
 
         // Allocate new ports
-        let new_allocations = net_mgr.auto_allocate_ports(uuid, &ports)
+        let new_allocations = net_mgr.auto_allocate_ports(uuid, &ports).await
             .map_err(|e| format!("Port allocation failed: {}", e))?;
         
         drop(net_mgr);
@@ -253,7 +272,7 @@ impl ContainerLifecycleManager {
         // Update tracker with new port allocations
         let new_port_allocs: Vec<PortAllocation> = new_allocations
             .iter()
-            .map(|(cp, hp)| PortAllocation {
+            .map(|(cp, hp): (&String, &String)| PortAllocation {
                 container_port: cp.clone(),
                 host_port: hp.clone(),
                 host_ip: "0.0.0.0".to_string(),
@@ -306,8 +325,7 @@ impl ContainerLifecycleManager {
         env: Option<HashMap<String, String>>,
         ports: Option<HashMap<String, String>>,
         limits: Option<ResourceLimits>,
-        install_content: Option<String>,
-        update_content: Option<String>,
+        install_script: Option<String>,
     ) -> Result<String, String> {
         info!("Lifecycle: Creating container {} with install", uuid);
 
@@ -332,8 +350,8 @@ impl ContainerLifecycleManager {
         // Track install result - None means no install needed, Some(true) = success, Some(false) = failed
         let mut install_result: Option<bool> = None;
 
-        // 4. If install_content provided, run install in temp container
-        if let Some(install_script) = &install_content {
+        // 4. If install_script provided, run install in temp container
+        if let Some(install_script) = &install_script {
             info!("Lifecycle: Running install script in temp container for {}", uuid);
 
             // Write install script
@@ -472,7 +490,6 @@ impl ContainerLifecycleManager {
         // 6. Create final container with ports
         info!("Lifecycle: Creating final container for {}", uuid);
         let limits_for_tracker = limits.clone();
-        let update_content_for_tracker = update_content.clone();
         let create_req = CreateContainerRequest {
             image: image.to_string(),
             name: Some(name.to_string()),
@@ -486,8 +503,7 @@ impl ContainerLifecycleManager {
             restart_policy: None,
             custom_uuid: Some(uuid.to_string()),
             limits,
-            install_content: None, // Already installed
-            update_content,
+            install_content: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -519,8 +535,6 @@ impl ContainerLifecycleManager {
                     ports: HashMap::new(),
                     env: None,
                     status: final_state.to_string(),
-                    install_content,
-                    update_content: update_content_for_tracker,
                     runtime: None,
                 };
                 self.container_tracker.save_container(&tracker).await.ok();
@@ -649,7 +663,6 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits: Some(tracker.limits.clone()),
             install_content: None,
-            update_content: None,
         };
 
         let (new_container_id, allocations) = manager.create_with_networking(
@@ -910,7 +923,6 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits: Some(tracker.limits.clone()),
             install_content: None,
-            update_content: tracker.update_content.clone(),
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -962,7 +974,7 @@ impl ContainerLifecycleManager {
         // Allocate ports
         let allocated_ports = if !ports_map.is_empty() {
             let mut net_mgr = self.network.write().await;
-            net_mgr.auto_allocate_ports(uuid, &ports_map)
+            net_mgr.auto_allocate_ports(uuid, &ports_map).await
                 .map_err(|e| format!("Port allocation failed: {}", e))?
         } else {
             HashMap::new()

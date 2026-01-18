@@ -353,7 +353,10 @@ Lightd Daemon v{}
     let network_config = config.network.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Network configuration not loaded"))?;
     
-    let mut network = NetworkManager::with_config(Arc::new(network_config.clone()))
+    // Create shared network config that can be updated dynamically
+    let network_config_shared = Arc::new(RwLock::new(network_config.clone()));
+    
+    let mut network = NetworkManager::with_config(network_config_shared.clone())
         .with_storage(&config.storage.base_path);
 
     let container_tracker = ContainerTrackingManager::new(&config.storage.containers_path);
@@ -501,6 +504,11 @@ Lightd Daemon v{}
     
     info!("Container event hub initialized");
 
+    // Initialize remote client for panel comms (before lifecycle manager)
+    let remote_client = Arc::new(crate::remote::Remote::new(
+        config.monitoring.as_ref().and_then(|m| m.remote.clone()),
+    ));
+
     // Initialize container lifecycle manager for stateless container recreation
     let network_arc = Arc::new(RwLock::new(network));
     let lifecycle = Arc::new(services::ContainerLifecycleManager::new(
@@ -509,14 +517,10 @@ Lightd Daemon v{}
         container_tracker_arc.clone(),
         network_arc.clone(),
         config.storage.volumes_path.clone(),
+        Some(remote_client.clone()),
     ));
     
     info!("Container lifecycle manager initialized");
-
-    // Initialize remote client for panel comms
-    let remote_client = Arc::new(crate::remote::Remote::new(
-        config.monitoring.as_ref().and_then(|m| m.remote.clone()),
-    ));
 
     // Initialize async power manager with remote client for callbacks
     let async_power = Arc::new(AsyncPowerManager::new(
@@ -562,6 +566,13 @@ Lightd Daemon v{}
         firewall: firewall_manager,
         file_tokens,
     };
+
+    // Public routes (no auth required) - for direct file upload/download with tokens
+    let public_routes = Router::new()
+        .route("/api/public/upload", post(handlers::filesystem::public_upload))
+        .route("/api/public/download", get(handlers::filesystem::public_download))
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -676,15 +687,8 @@ Lightd Daemon v{}
         ))
         .with_state(state.clone());
 
-    // Public routes (no auth required) - for direct file upload/download with tokens
-    let public_routes = Router::new()
-        .route("/api/public/upload", post(handlers::filesystem::public_upload))
-        .route("/api/public/download", get(handlers::filesystem::public_download))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
-
-    // Merge authenticated and public routes
-    let app = app.merge(public_routes);
+    // Merge public routes (no auth) with authenticated routes
+    let app = public_routes.merge(app);
 
     if config.authorization.enabled {
         info!("Authorization is ENABLED - all routes require valid Bearer token");

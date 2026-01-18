@@ -117,6 +117,21 @@ impl Remote {
         let _ = self.post(&path, body).await;
     }
 
+    /// Send container lock status (for reinstall/recreation flow)
+    /// Status can be: "locked" (server locked during reinstall), "ready" (server ready after reinstall)
+    pub async fn send_container_status(&self, container_uuid: &str, status: &str, new_container_id: Option<&str>) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        let body = json!({
+            "status": status,
+            "container_id": new_container_id
+        });
+        let path = format!("/api/remote/{}/status", container_uuid);
+        let _ = self.post(&path, body).await;
+    }
+
     /// Post RU deduction (used by resource monitor)
     pub async fn post_ru_deduction(&self, container_uuid: &str, amount: f64, description: &str) {
         if !self.is_enabled() {

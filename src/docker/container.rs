@@ -212,7 +212,7 @@ impl ContainerManager {
         let allocated_ports = if let Some(ports) = &req.ports {
             // Use UUID for port allocation tracking instead of user-provided name
             let mut net_mgr = network_manager.write().await;
-            net_mgr.auto_allocate_ports(container_uuid, ports)
+            net_mgr.auto_allocate_ports(container_uuid, ports).await
                 .map_err(|e| anyhow::anyhow!("Port allocation failed: {}", e))?
         } else {
             HashMap::new()
@@ -229,7 +229,7 @@ impl ContainerManager {
                 port_spec,
                 Some(vec![bollard::models::PortBinding {
                     host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(host_port.clone()),
+                    host_port: Some(host_port.to_string()),
                 }]),
             );
         }

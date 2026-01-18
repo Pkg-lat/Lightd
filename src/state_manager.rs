@@ -37,8 +37,6 @@ pub struct ContainerState {
     pub lock_reason: Option<String>,
     pub locked_at: Option<i64>,
     pub restart_policy: Option<String>,
-    pub install_content: Option<String>,
-    pub update_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,8 +419,6 @@ impl From<&ContainerTracker> for ContainerState {
             lock_reason: None,
             locked_at: None,
             restart_policy: None,
-            install_content: tracker.install_content.clone(),
-            update_content: tracker.update_content.clone(),
         }
     }
 }

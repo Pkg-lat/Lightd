@@ -131,7 +131,7 @@ pub struct DirectUrlResponse {
 /// Check if container is locked (installing/updating) - returns error message if locked
 fn check_container_locked_for_fs(state: &AppState, container_id: &str) -> Option<String> {
     // Try to find by container ID first
-    if let Some((uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
+    if let Some((_uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
         if container_state.locked.unwrap_or(false) {
             let reason = container_state.lock_reason.clone()
                 .unwrap_or_else(|| "Container is locked".to_string());
@@ -1091,7 +1091,10 @@ pub async fn public_download(
     let path_clone = backend_path.clone();
     
     // Get the full file path on disk
-    let full_path = format!("{}/{}_data{}", volumes_path, uuid_clone, path_clone.trim_start_matches("/home/container"));
+    // The volume is stored at {volumes_path}/{uuid}/{file_path}
+    // backend_path is like "/home/container/spigot.yml", we need to strip "/home/container"
+    let relative_path = path_clone.trim_start_matches("/home/container");
+    let full_path = format!("{}/{}{}", volumes_path, uuid_clone, relative_path);
     
     // Open file for streaming
     let file = match tokio::fs::File::open(&full_path).await {

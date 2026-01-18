@@ -1,5 +1,6 @@
 #!/bin/bash
 # Setup script for Lightd - Creates unprivileged user and configures permissions
+# Depreacted and made by some Ai, js run it in root and in install change the user.
 
 set -e
 

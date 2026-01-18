@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{TcpListener, SocketAddr};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 use serde::{Serialize, Deserialize};
 use crate::network_config::NetworkConfig;
@@ -24,7 +25,7 @@ pub struct NetworkManager {
     allocated_ports: HashMap<u16, String>, // port -> container_id
     container_ports: HashMap<String, Vec<PortAllocation>>, // container_id -> port allocations
     port_range: (u16, u16), // (start, end) port range for allocation
-    network_config: Arc<NetworkConfig>,
+    network_config: Arc<RwLock<NetworkConfig>>, // Shared config that updates dynamically
     storage_path: Option<String>,
 }
 
@@ -34,16 +35,20 @@ impl NetworkManager {
             allocated_ports: HashMap::new(),
             container_ports: HashMap::new(),
             port_range: (start_port, end_port),
-            network_config: Arc::new(NetworkConfig::default()),
+            network_config: Arc::new(RwLock::new(NetworkConfig::default())),
             storage_path: None,
         }
     }
 
-    pub fn with_config(network_config: Arc<NetworkConfig>) -> Self {
+    pub fn with_config(network_config: Arc<RwLock<NetworkConfig>>) -> Self {
+        // Port range is just for display purposes now
+        // The actual available ports come from network_config.ports.available_ports
+        let port_range = (9000, 19999); // Default display range
+        
         Self {
             allocated_ports: HashMap::new(),
             container_ports: HashMap::new(),
-            port_range: (network_config.ports.range_start, network_config.ports.range_end),
+            port_range,
             network_config,
             storage_path: None,
         }
@@ -99,23 +104,44 @@ impl NetworkManager {
         info!("Restored {} port allocations from container data", self.allocated_ports.len());
     }
 
-    /// Find an available port from the available_ports array first, then fallback to range
-    pub fn find_available_port(&mut self) -> Option<u16> {
-        // First try to use ports from the available_ports array
-        let available_ports = self.network_config.get_available_ports();
-        for &port in available_ports {
-            if !self.allocated_ports.contains_key(&port) && self.is_port_available(port) {
-                return Some(port);
-            }
+    /// Find an available port from the available_ports array ONLY
+    /// No range fallback - ports must be explicitly added to the pool
+    /// This method now reads fresh config each time to see newly added ports
+    pub async fn find_available_port(&mut self) -> Option<u16> {
+        // Read fresh config to see any newly added ports
+        let config = self.network_config.read().await;
+        let available_ports = config.get_available_ports().clone();
+        drop(config);
+        
+        if available_ports.is_empty() {
+            tracing::error!("Port pool is empty! Add ports via: POST /network/ports/add {{\"ports\": [9000, 9001, ...]}}");
+            return None;
         }
-
-        // Fallback to range-based allocation if no ports in array are available
-        for port in self.port_range.0..=self.port_range.1 {
-            if !self.allocated_ports.contains_key(&port) && self.is_port_available(port) {
+        
+        info!("Searching {} ports in pool for available port", available_ports.len());
+        
+        // Find first port that is:
+        // 1. In the available_ports array
+        // 2. Not already allocated to a container
+        // 3. Not in use on the system
+        for &port in &available_ports {
+            if self.allocated_ports.contains_key(&port) {
+                continue; // Already allocated to a container
+            }
+            
+            if self.is_port_available(port) {
+                info!("Found available port {} from pool", port);
                 return Some(port);
+            } else {
+                warn!("Port {} in pool but in use on system", port);
             }
         }
         
+        tracing::error!(
+            "No available ports! Pool size: {}, Allocated: {}, All ports in pool are either allocated or in use",
+            available_ports.len(),
+            self.allocated_ports.len()
+        );
         None
     }
 
@@ -187,7 +213,7 @@ impl NetworkManager {
     }
 
     /// Auto-allocate ports with host IP configuration support
-    pub fn auto_allocate_ports_with_config(
+    pub async fn auto_allocate_ports_with_config(
         &mut self,
         container_id: &str,
         port_configs: &[crate::models::PortConfig],
@@ -201,13 +227,19 @@ impl NetworkManager {
             let host_port = if let Some(ref port_str) = config.host_port {
                 if port_str == "auto" || port_str.is_empty() {
                     // Auto-allocate a port
-                    match self.find_available_port() {
+                    match self.find_available_port().await {
                         Some(port) => {
                             self.allocate_port(port, container_id.to_string())?;
                             port.to_string()
                         }
                         None => {
-                            return Err("No available ports in the configured range".to_string());
+                            let config = self.network_config.read().await;
+                            let available_count = config.get_available_ports().len();
+                            let allocated_count = self.allocated_ports.len();
+                            return Err(format!(
+                                "No available ports! Available pool: {}, Allocated: {}. Add ports via: POST /network/ports/add {{\"ports\": [9000, 9001, ...]}}",
+                                available_count, allocated_count
+                            ));
                         }
                     }
                 } else {
@@ -220,13 +252,19 @@ impl NetworkManager {
                 }
             } else {
                 // Auto-allocate if no host port specified
-                match self.find_available_port() {
+                match self.find_available_port().await {
                     Some(port) => {
                         self.allocate_port(port, container_id.to_string())?;
                         port.to_string()
                     }
                     None => {
-                        return Err("No available ports in the configured range".to_string());
+                        let config = self.network_config.read().await;
+                        let available_count = config.get_available_ports().len();
+                        let allocated_count = self.allocated_ports.len();
+                        return Err(format!(
+                            "No available ports! Available pool: {}, Allocated: {}. Add ports via: POST /network/ports/add {{\"ports\": [9000, 9001, ...]}}",
+                            available_count, allocated_count
+                        ));
                     }
                 }
             };
@@ -249,19 +287,25 @@ impl NetworkManager {
     }
 
     /// Auto-allocate ports for a container based on requested mappings (legacy method)
-    pub fn auto_allocate_ports(&mut self, container_id: &str, requested_ports: &HashMap<String, String>) -> Result<HashMap<String, String>, String> {
+    pub async fn auto_allocate_ports(&mut self, container_id: &str, requested_ports: &HashMap<String, String>) -> Result<HashMap<String, String>, String> {
         let mut allocated_mappings = HashMap::new();
 
         for (container_port, host_port) in requested_ports {
             let final_host_port = if host_port.is_empty() || host_port == "auto" {
                 // Auto-allocate a port
-                match self.find_available_port() {
+                match self.find_available_port().await {
                     Some(port) => {
                         self.allocate_port(port, container_id.to_string())?;
                         port.to_string()
                     }
                     None => {
-                        return Err("No available ports in the configured range".to_string());
+                        let config = self.network_config.read().await;
+                        let available_count = config.get_available_ports().len();
+                        let allocated_count = self.allocated_ports.len();
+                        return Err(format!(
+                            "No available ports! Available pool: {}, Allocated: {}. Add ports via: POST /network/ports/add {{\"ports\": [9000, 9001, ...]}}",
+                            available_count, allocated_count
+                        ));
                     }
                 }
             } else {

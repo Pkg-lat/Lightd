@@ -128,10 +128,10 @@ pub async fn get_available_ports(
 ) -> Result<Json<ApiResponse<AvailablePortsResponse>>, StatusCode> {
     info!("Getting available ports");
     
-    let net_mgr = state.network.read().await;
-    let allocated = net_mgr.get_allocated_ports();
-    let port_range = net_mgr.get_port_range();
-    drop(net_mgr);
+    let (allocated, port_range) = {
+        let net_mgr = state.network.read().await;
+        (net_mgr.get_allocated_ports().clone(), net_mgr.get_port_range())
+    };
     
     // Get available ports from network config
     let net_config = state.network_config.read().await;
@@ -153,6 +153,7 @@ pub async fn get_available_ports(
     
     Ok(Json(ApiResponse::success(response)))
 }
+
 
 /// Add a port binding to a container
 /// Port changes are tracked and applied when the container is recreated on restart
@@ -189,7 +190,7 @@ pub async fn add_port_binding(
     
     let host_port = if let Some(ref port_str) = req.host_port {
         if port_str == "auto" || port_str.is_empty() {
-            match net_mgr.find_available_port() {
+            match net_mgr.find_available_port().await {
                 Some(port) => {
                     if let Err(e) = net_mgr.allocate_port(port, tracker.custom_uuid.clone()) {
                         return Ok(Json(ApiResponse::error(e)));
@@ -214,7 +215,7 @@ pub async fn add_port_binding(
             port
         }
     } else {
-        match net_mgr.find_available_port() {
+        match net_mgr.find_available_port().await {
             Some(port) => {
                 if let Err(e) = net_mgr.allocate_port(port, tracker.custom_uuid.clone()) {
                     return Ok(Json(ApiResponse::error(e)));
@@ -363,7 +364,7 @@ pub async fn update_port_binding(
     
     // Allocate new port
     let new_host_port = if req.new_host_port == "auto" || req.new_host_port.is_empty() {
-        match net_mgr.find_available_port() {
+        match net_mgr.find_available_port().await {
             Some(port) => {
                 if let Err(e) = net_mgr.allocate_port(port, tracker.custom_uuid.clone()) {
                     return Ok(Json(ApiResponse::error(e)));
@@ -481,8 +482,14 @@ pub async fn apply_port_changes(
     
     info!("Found container {} with {} ports, triggering recreation", uuid, tracker.allocated_ports.len());
     
+    // Notify remote panel that port changes are starting
+    if let Some(ref remote) = state.remote {
+        remote.send_install_status(&uuid, "recreating", Some("Applying port changes")).await;
+    }
+    
     // Spawn background task for recreation
     let lifecycle = state.lifecycle.clone();
+    let remote = state.remote.clone();
     let uuid_clone = uuid.clone();
     
     tokio::spawn(async move {
@@ -490,9 +497,17 @@ pub async fn apply_port_changes(
         match lifecycle.recreate_container(&uuid_clone, None).await {
             Ok(new_id) => {
                 info!("Port changes applied for {}, new container ID: {}", uuid_clone, new_id);
+                // Notify remote panel of success
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_success", Some("Port changes applied")).await;
+                }
             }
             Err(e) => {
                 error!("Failed to apply port changes for {}: {}", uuid_clone, e);
+                // Notify remote panel of failure
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Port change failed: {}", e))).await;
+                }
             }
         }
     });

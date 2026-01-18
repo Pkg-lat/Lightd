@@ -98,8 +98,6 @@ pub async fn create_container(
         lock_reason: None,
         locked_at: None,
         restart_policy: None,
-        install_content: req.install_content.clone(),
-        update_content: req.update_content.clone(),
     };
 
     // Add to state (lock-free)
@@ -174,8 +172,6 @@ pub async fn create_container(
                 ports: req.ports.clone().unwrap_or_default(),
                 env: req.env.clone(),
                 status: "created".to_string(),
-                install_content: req.install_content.clone(),
-                update_content: req.update_content.clone(),
                 runtime: None,
             };
             
@@ -349,7 +345,7 @@ pub async fn list_containers(
 
 /// Check if container is locked (installing/updating)
 fn check_container_locked(state: &AppState, container_id: &str) -> Option<String> {
-    if let Some((uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
+    if let Some((_uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
         if container_state.locked.unwrap_or(false) {
             let reason = container_state.lock_reason.clone()
                 .unwrap_or_else(|| "Container is locked".to_string());
@@ -543,15 +539,29 @@ pub async fn recreate_container(
     
     // Spawn background task for recreation using lifecycle manager
     let lifecycle = state.lifecycle.clone();
+    let remote = state.remote.clone();
     let uuid_clone = uuid.clone();
+    
+    // Notify remote panel that recreation is starting
+    if let Some(ref remote) = state.remote {
+        remote.send_install_status(&uuid, "recreating", Some("Container recreation in progress")).await;
+    }
     
     tokio::spawn(async move {
         match lifecycle.recreate_container(&uuid_clone, None).await {
             Ok(new_id) => {
                 info!("Container {} recreated successfully, new ID: {}", uuid_clone, new_id);
+                // Notify remote panel of success
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_success", Some("Container recreated successfully")).await;
+                }
             }
             Err(e) => {
                 error!("Container {} recreation failed: {}", uuid_clone, e);
+                // Notify remote panel of failure
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Recreation failed: {}", e))).await;
+                }
             }
         }
     });
@@ -1313,15 +1323,29 @@ pub async fn update_container_config(
     
     // Spawn background task for recreation
     let lifecycle = state.lifecycle.clone();
+    let remote = state.remote.clone();
     let uuid_clone = uuid.clone();
+    
+    // Notify remote panel that config update is starting
+    if let Some(ref remote) = state.remote {
+        remote.send_install_status(&uuid, "recreating", Some("Applying configuration changes")).await;
+    }
     
     tokio::spawn(async move {
         match lifecycle.recreate_container(&uuid_clone, Some(update)).await {
             Ok(new_id) => {
                 info!("Container {} config updated, new ID: {}", uuid_clone, new_id);
+                // Notify remote panel of success
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_success", Some("Configuration updated successfully")).await;
+                }
             }
             Err(e) => {
                 error!("Container {} config update failed: {}", uuid_clone, e);
+                // Notify remote panel of failure
+                if let Some(ref remote) = remote {
+                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Config update failed: {}", e))).await;
+                }
             }
         }
     });
@@ -1439,6 +1463,11 @@ pub async fn reinstall_container(
     // Set state to installing
     state.state_manager.update_container_state(&uuid, "installing").await.ok();
     
+    // Notify remote panel that container is locked for reinstall
+    if let Some(ref remote) = state.remote {
+        remote.send_install_status(&uuid, "installing", Some("Reinstalling container")).await;
+    }
+    
     // SYNCHRONOUS: Create new container and get new ID
     let new_container_id = match create_reinstall_container(
         &uuid,
@@ -1483,13 +1512,14 @@ pub async fn reinstall_container(
         match result {
             Ok(_) => {
                 info!("Reinstall complete for {}", uuid_clone);
+                state_manager.unlock_container(&uuid_clone).await.ok();
                 if let Some(ref remote) = remote {
                     remote.send_install_status(&uuid_clone, "install_success", None).await;
                 }
-                state_manager.unlock_container(&uuid_clone).await.ok();
             }
             Err(e) => {
                 error!("Reinstall install phase failed for {}: {}", uuid_clone, e);
+                state_manager.unlock_container(&uuid_clone).await.ok();
                 if let Some(ref remote) = remote {
                     remote.send_install_status(&uuid_clone, "install_failed", Some(&e)).await;
                 }
@@ -1591,7 +1621,6 @@ async fn create_reinstall_container(
         custom_uuid: Some(uuid.to_string()),
         limits: req.limits.clone().or(Some(tracker.limits.clone())),
         install_content: None,
-        update_content: None,
     };
     
     let (new_container_id, allocations) = manager.create_with_networking(

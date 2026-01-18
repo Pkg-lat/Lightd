@@ -16,8 +16,8 @@ pub struct CreateContainerRequest {
     pub restart_policy: Option<String>,
     pub custom_uuid: Option<String>,
     pub limits: Option<ResourceLimits>,
-    pub install_content: Option<String>, // Shell script to run for installation
-    pub update_content: Option<String>,  // Shell script to run for updates
+    /// Install script - used during creation but not persisted to state/tracker
+    pub install_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -45,8 +45,6 @@ pub struct ContainerTracker {
     pub ports: HashMap<String, String>,
     pub env: Option<HashMap<String, String>>,
     pub status: String,
-    pub install_content: Option<String>,
-    pub update_content: Option<String>,
     /// Runtime config for state detection (stop command, startup log detection)
     #[serde(default)]
     pub runtime: Option<RuntimeConfig>,
