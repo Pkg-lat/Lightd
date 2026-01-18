@@ -6,11 +6,11 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use bollard::container::{LogOutput, LogsOptions, StatsOptions};
-use bollard::system::EventsOptions;
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use chrono::{DateTime, FixedOffset};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque, HashMap};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
@@ -110,7 +110,6 @@ impl WebSocketHandler {
         let container_uuid = self.token.container_uuid.clone();
         let docker = Arc::new(self.state.docker.client.clone());
         let event_hub = self.state.event_hub.clone();
-        let app_state = self.state.clone(); // Clone for power actions
 
         info!("WebSocket opened for container: {} ({})", container_uuid, container_id);
 
@@ -143,13 +142,6 @@ impl WebSocketHandler {
         } else {
             None
         };
-
-        // Always spawn Docker events streamer to catch state changes
-        let docker_events_task = Self::spawn_docker_events_streamer(
-            docker.clone(),
-            container_id.clone(),
-            event_hub.clone(),
-        );
 
         let mut container_running = is_running;
         let mut current_log_task: Option<tokio::task::JoinHandle<()>> = log_task;
@@ -184,10 +176,6 @@ impl WebSocketHandler {
                             let msg = WsMessage::console_output(&line).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
-                        Ok(ContainerEvent::DuplicateOutput { line }) => {
-                            let msg = WsMessage::duplicate_event(&line).to_json();
-                            if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
-                        }
                         Ok(ContainerEvent::Stats(stats)) => {
                             let msg = WsMessage::stats(
                                 stats.memory_bytes, stats.memory_limit_bytes, stats.cpu_percent,
@@ -197,46 +185,17 @@ impl WebSocketHandler {
                             ).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
-                        Ok(ContainerEvent::DockerEvent { action, status }) => {
-                            let msg = WsMessage::docker_event(&action, &status).to_json();
-                            if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
-                        }
                         Ok(ContainerEvent::DaemonMessage { message }) => {
                             let msg = WsMessage::daemon_message(&message).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
                         Ok(ContainerEvent::PowerActionStarted { action }) => {
-                            // Simple message: "Server starting..." or "Server stopping..."
-                            let simple_msg = match action.as_str() {
-                                "start" => "Server starting...",
-                                "stop" => "Server stopping...",
-                                "restart" => "Server restarting...",
-                                "kill" => "Killing server...",
-                                _ => &action,
-                            };
-                            let msg = WsMessage::daemon_message(simple_msg).to_json();
+                            let msg = WsMessage::daemon_message(&format!("Power action started: {}", action)).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
-                        Ok(ContainerEvent::PowerActionCompleted { action, success, message: _ }) => {
-                            // Simple message: "Server started" or "Server stopped"
-                            let simple_msg = if success {
-                                match action.as_str() {
-                                    "start" => "Server started",
-                                    "stop" => "Server stopped",
-                                    "restart" => "Server restarted",
-                                    "kill" => "Server killed",
-                                    _ => "Done",
-                                }
-                            } else {
-                                match action.as_str() {
-                                    "start" => "Failed to start",
-                                    "stop" => "Failed to stop",
-                                    "restart" => "Failed to restart",
-                                    "kill" => "Failed to kill",
-                                    _ => "Failed",
-                                }
-                            };
-                            let msg = WsMessage::daemon_message(simple_msg).to_json();
+                        Ok(ContainerEvent::PowerActionCompleted { action, success, message }) => {
+                            let status = if success { "completed" } else { "failed" };
+                            let msg = WsMessage::daemon_message(&format!("Power action {}: {} - {}", action, status, message)).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -253,36 +212,18 @@ impl WebSocketHandler {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                                match client_msg.event.as_str() {
-                                    // Send command to container stdin
-                                    "send_command" if !client_msg.args.is_empty() => {
-                                        let cmd = &client_msg.args[0];
-                                        debug!("Sending command to container stdin {}: {}", container_id, cmd);
-                                        
-                                        let docker_clone = docker.clone();
-                                        let cid = container_id.clone();
-                                        let hub = event_hub.clone();
-                                        let command = cmd.clone();
-                                        
-                                        tokio::spawn(async move {
-                                            Self::send_stdin_command(&docker_clone, &cid, &command, &hub).await;
-                                        });
-                                    }
-                                    // Power action - like Pterodactyl Wings
-                                    "set_state" if !client_msg.args.is_empty() => {
-                                        let action = &client_msg.args[0];
-                                        info!("Power action via WebSocket for {}: {}", container_id, action);
-                                        
-                                        let state_clone = app_state.clone();
-                                        let cid = container_id.clone();
-                                        let uid = container_uuid.clone();
-                                        let act = action.clone();
-                                        
-                                        tokio::spawn(async move {
-                                            Self::handle_power_action(&state_clone, &cid, &uid, &act).await;
-                                        });
-                                    }
-                                    _ => {}
+                                if client_msg.event == "send_command" && !client_msg.args.is_empty() {
+                                    let cmd = &client_msg.args[0];
+                                    debug!("Executing command in {}: {}", container_id, cmd);
+                                    
+                                    let docker_clone = docker.clone();
+                                    let cid = container_id.clone();
+                                    let hub = event_hub.clone();
+                                    let command = cmd.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        Self::execute_command(&docker_clone, &cid, &command, &hub).await;
+                                    });
                                 }
                             }
                         }
@@ -309,7 +250,6 @@ impl WebSocketHandler {
 
         if let Some(task) = current_log_task { task.abort(); }
         if let Some(task) = current_stats_task { task.abort(); }
-        docker_events_task.abort();
         event_hub.unsubscribe(&container_id).await;
         info!("WebSocket closed for container: {}", container_id);
     }
@@ -420,9 +360,6 @@ impl WebSocketHandler {
                                         if !recent.seen_or_insert(key) {
                                             backoff = Duration::from_millis(250);
                                             event_hub.broadcast_console(&container_id, content).await;
-                                        } else {
-                                            // Broadcast duplicate event instead of silently skipping
-                                            event_hub.broadcast_duplicate(&container_id, content).await;
                                         }
                                     }
                                 }
@@ -496,9 +433,6 @@ impl WebSocketHandler {
 
                                 if !recent.seen_or_insert(key) {
                                     event_hub.broadcast_console(&container_id, content).await;
-                                } else {
-                                    // Broadcast duplicate event instead of silently skipping
-                                    event_hub.broadcast_duplicate(&container_id, content).await;
                                 }
                             }
                         }
@@ -594,184 +528,60 @@ impl WebSocketHandler {
         })
     }
 
-    /// Spawn a Docker events streamer to listen for container lifecycle events
-    fn spawn_docker_events_streamer(
-        docker: Arc<bollard::Docker>,
-        container_id: String,
-        event_hub: Arc<ContainerEventHub>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_millis(250);
-
-            loop {
-                // Filter events for this specific container
-                let mut filters = HashMap::new();
-                filters.insert("container".to_string(), vec![container_id.clone()]);
-                filters.insert("type".to_string(), vec!["container".to_string()]);
-
-                let opts = EventsOptions {
-                    since: None,
-                    until: None,
-                    filters,
-                };
-
-                let mut stream = docker.events(Some(opts));
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(event) => {
-                            backoff = Duration::from_millis(250);
-
-                            let action = event.action.as_deref().unwrap_or("unknown");
-                            // Get status from actor attributes if available
-                            let status = event.actor
-                                .as_ref()
-                                .and_then(|a| a.attributes.as_ref())
-                                .and_then(|attrs| attrs.get("exitCode"))
-                                .map(|s| s.as_str())
-                                .unwrap_or("");
-
-                            // Map Docker actions to power states
-                            let power_state = match action {
-                                "start" => "running",
-                                "stop" | "kill" | "die" => "stopped",
-                                "pause" => "paused",
-                                "unpause" => "running",
-                                "create" => "created",
-                                "destroy" => "destroyed",
-                                "restart" => "running",
-                                "oom" => "oom",
-                                _ => action,
-                            };
-
-                            debug!(
-                                "Docker event for {}: action={}, status={}, power={}",
-                                container_id, action, status, power_state
-                            );
-
-                            // Broadcast the Docker event
-                            event_hub.broadcast_docker_event(&container_id, action, power_state).await;
-
-                            // Also broadcast state change for relevant actions
-                            match action {
-                                "start" => {
-                                    event_hub.broadcast_state(&container_id, "running").await;
-                                }
-                                "stop" | "kill" | "die" => {
-                                    event_hub.broadcast_state(&container_id, "stopped").await;
-                                }
-                                "pause" => {
-                                    event_hub.broadcast_state(&container_id, "paused").await;
-                                }
-                                "unpause" => {
-                                    event_hub.broadcast_state(&container_id, "running").await;
-                                }
-                                "restart" => {
-                                    // Restart triggers stop then start, so we'll get both events
-                                    event_hub.broadcast_state(&container_id, "running").await;
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Docker events stream error for {}: {}", container_id, e);
-                            break;
-                        }
-                    }
-                }
-
-                // Stream ended, reconnect after backoff
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(10));
-            }
-        })
-    }
-
-    /// Send a command to the container's stdin (for interactive processes like game servers)
-    /// This writes directly to the container's stdin stream, not via exec
-    async fn send_stdin_command(
+    async fn execute_command(
         docker: &bollard::Docker,
         container_id: &str,
         command: &str,
         event_hub: &ContainerEventHub,
     ) {
-        use bollard::container::AttachContainerOptions;
-        use tokio::io::AsyncWriteExt;
-        
-        info!("Sending stdin command to container {}: {}", container_id, command);
-        
-        let options = AttachContainerOptions::<String> {
-            stdin: Some(true),
-            stdout: Some(false),
-            stderr: Some(false),
-            stream: Some(true),
+        let exec_config = CreateExecOptions {
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(vec!["sh", "-c", command]),
             ..Default::default()
         };
 
-        match docker.attach_container(container_id, Some(options)).await {
-            Ok(attach_result) => {
-                let mut input = attach_result.input;
-                
-                // Send command with newline
-                let command_with_newline = format!("{}\n", command);
-                match input.write_all(command_with_newline.as_bytes()).await {
-                    Ok(_) => {
-                        if let Err(e) = input.flush().await {
-                            warn!("Failed to flush stdin for {}: {}", container_id, e);
+        match docker.create_exec(container_id, exec_config).await {
+            Ok(exec) => {
+                match docker.start_exec(&exec.id, None).await {
+                    Ok(StartExecResults::Attached { mut output, .. }) => {
+                        while let Some(result) = output.next().await {
+                            match result {
+                                Ok(log_output) => {
+                                    let message_bytes = match log_output {
+                                        LogOutput::StdOut { message } |
+                                        LogOutput::StdErr { message } |
+                                        LogOutput::Console { message } |
+                                        LogOutput::StdIn { message } => message,
+                                    };
+
+                                    let text = String::from_utf8_lossy(&message_bytes);
+                                    for line in text.lines() {
+                                        let line = line.trim_end();
+                                        if !line.is_empty() {
+                                            event_hub.broadcast_console(container_id, line).await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Exec output error for {}: {}", container_id, e);
+                                    break;
+                                }
+                            }
                         }
-                        info!("Stdin command sent successfully to container {}", container_id);
+                    }
+                    Ok(StartExecResults::Detached) => {
+                        debug!("Exec started in detached mode for {}", container_id);
                     }
                     Err(e) => {
-                        error!("Failed to write to stdin for {}: {}", container_id, e);
-                        event_hub.broadcast_console(container_id, &format!("Error sending command: {}", e)).await;
+                        error!("Failed to start exec for {}: {}", container_id, e);
+                        event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to attach to container {} stdin: {}", container_id, e);
+                error!("Failed to create exec for {}: {}", container_id, e);
                 event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
-            }
-        }
-    }
-
-    /// Handle power action from WebSocket (like Pterodactyl Wings)
-    /// Actions: start, stop, restart, kill
-    async fn handle_power_action(
-        state: &AppState,
-        container_id: &str,
-        uuid: &str,
-        action: &str,
-    ) {
-        info!("Handling power action '{}' for container {} ({})", action, uuid, container_id);
-        
-        match action {
-            "start" => {
-                if let Err(e) = state.async_power.start(container_id.to_string(), uuid.to_string()).await {
-                    error!("Failed to start container {}: {}", container_id, e);
-                    state.event_hub.broadcast_message(container_id, &format!("Start failed: {}", e)).await;
-                }
-            }
-            "stop" => {
-                if let Err(e) = state.async_power.stop(container_id.to_string(), uuid.to_string()).await {
-                    error!("Failed to stop container {}: {}", container_id, e);
-                    state.event_hub.broadcast_message(container_id, &format!("Stop failed: {}", e)).await;
-                }
-            }
-            "restart" => {
-                if let Err(e) = state.async_power.restart(container_id.to_string(), uuid.to_string()).await {
-                    error!("Failed to restart container {}: {}", container_id, e);
-                    state.event_hub.broadcast_message(container_id, &format!("Restart failed: {}", e)).await;
-                }
-            }
-            "kill" => {
-                if let Err(e) = state.async_power.kill(container_id.to_string(), uuid.to_string()).await {
-                    error!("Failed to kill container {}: {}", container_id, e);
-                    state.event_hub.broadcast_message(container_id, &format!("Kill failed: {}", e)).await;
-                }
-            }
-            _ => {
-                warn!("Unknown power action: {}", action);
-                state.event_hub.broadcast_message(container_id, &format!("Unknown action: {}", action)).await;
             }
         }
     }

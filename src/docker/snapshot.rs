@@ -62,7 +62,7 @@ impl SnapshotManager {
         let snapshot_id = Uuid::new_v4().to_string();
         let snapshot_dir = format!("{}/{}", self.snapshots_path, snapshot_id);
         
-        info!("Creating workspace snapshot {} for container {}", snapshot_id, container_uuid);
+        info!("Creating workspace snapshot {} for container {}", snapshot_id, container_id);
         
         // Create snapshot directory
         fs::create_dir_all(&snapshot_dir).await?;
@@ -71,16 +71,10 @@ impl SnapshotManager {
         let container_state = state_manager.get_container(container_uuid)
             .ok_or_else(|| anyhow::anyhow!("Container not found in state manager"))?;
         
-        // Get the volume path from storage base path
-        let volume_path = format!("{}/volumes/{}", 
-            self.snapshots_path.trim_end_matches("/snapshots"), 
-            container_uuid
-        );
-        
-        // 1. Create tar archive of workspace files directly from host mount
-        info!("Creating tar archive of workspace files from {}", volume_path);
+        // 1. Create tar archive of workspace files
+        info!("Creating tar archive of workspace files...");
         let archive_path = format!("{}/workspace.tar.gz", snapshot_dir);
-        let file_count = self.create_workspace_archive_direct(&volume_path, &archive_path).await?;
+        let file_count = self.create_workspace_archive(container_id, &archive_path).await?;
         
         // 2. Calculate archive size
         let size_bytes = fs::metadata(&archive_path).await?.len();
@@ -111,13 +105,13 @@ impl SnapshotManager {
     pub async fn restore_snapshot(
         &self,
         snapshot_id: &str,
-        container_uuid: &str,
+        container_id: &str,
     ) -> anyhow::Result<()> {
         let snapshot_dir = format!("{}/{}", self.snapshots_path, snapshot_id);
         let metadata_path = format!("{}/metadata.json", snapshot_dir);
         let archive_path = format!("{}/workspace.tar.gz", snapshot_dir);
         
-        info!("Restoring workspace snapshot {} to container {}", snapshot_id, container_uuid);
+        info!("Restoring workspace snapshot {} to container {}", snapshot_id, container_id);
         
         // Load metadata
         let metadata_content = fs::read_to_string(&metadata_path).await?;
@@ -128,19 +122,13 @@ impl SnapshotManager {
             return Err(anyhow::anyhow!("Snapshot archive not found: {}", archive_path));
         }
         
-        // Get the volume path from storage base path
-        let volume_path = format!("{}/volumes/{}", 
-            self.snapshots_path.trim_end_matches("/snapshots"), 
-            container_uuid
-        );
+        // 1. Clear workspace directory
+        info!("Clearing workspace directory...");
+        self.clear_workspace(container_id).await?;
         
-        // 1. Clear workspace directory directly on host
-        info!("Clearing workspace directory at {}", volume_path);
-        self.clear_workspace_direct(&volume_path).await?;
-        
-        // 2. Extract archive to workspace directly on host
+        // 2. Extract archive to workspace
         info!("Extracting archive to workspace...");
-        self.extract_workspace_archive_direct(&volume_path, &archive_path).await?;
+        self.extract_workspace_archive(container_id, &archive_path).await?;
         
         info!("Snapshot {} restored successfully ({} files)", 
               snapshot_id, metadata.file_count);
@@ -199,97 +187,120 @@ impl SnapshotManager {
         Ok(metadata)
     }
 
-    // Private helper methods - Direct filesystem operations
+    // Private helper methods
 
-    async fn create_workspace_archive_direct(&self, volume_path: &str, archive_path: &str) -> anyhow::Result<u64> {
-        // Check if volume path exists
-        if !Path::new(volume_path).exists() {
-            return Err(anyhow::anyhow!("Volume path does not exist: {}", volume_path));
-        }
-
-        // Count files
-        let output = Command::new("sh")
+    async fn create_workspace_archive(&self, container_id: &str, archive_path: &str) -> anyhow::Result<u64> {
+        // Use docker exec to create tar archive of workspace
+        let output = Command::new("docker")
             .args(&[
-                "-c",
-                &format!("cd '{}' && find . -type f 2>/dev/null | wc -l", volume_path)
-            ])
-            .output()
-            .await?;
-
-        let file_count = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(0);
-
-        // Create tar archive directly from host filesystem
-        let output = Command::new("tar")
-            .args(&[
-                "-czf",
-                archive_path,
-                "-C",
-                volume_path,
-                "."
+                "exec",
+                container_id,
+                "sh", "-c",
+                "cd /workspace && find . -type f | wc -l && tar -czf - . 2>/dev/null || echo 'No files to archive'"
             ])
             .output()
             .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                warn!("Archive creation had warnings: {}", stderr);
-            }
+            return Err(anyhow::anyhow!("Failed to create workspace archive: {}", 
+                String::from_utf8_lossy(&output.stderr)));
         }
 
-        debug!("Created workspace archive with {} files from {}", file_count, volume_path);
+        // Get file count from first line of output
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = output_str.lines().collect();
+        let file_count = if !lines.is_empty() {
+            lines[0].trim().parse::<u64>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Create the actual archive
+        let output = Command::new("docker")
+            .args(&[
+                "exec",
+                container_id,
+                "sh", "-c",
+                "cd /workspace && tar -czf - . 2>/dev/null || true"
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            warn!("Archive creation had warnings: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        // Write archive data to file
+        fs::write(archive_path, &output.stdout).await?;
+        
+        debug!("Created workspace archive with {} files", file_count);
         Ok(file_count)
     }
 
-    async fn clear_workspace_direct(&self, volume_path: &str) -> anyhow::Result<()> {
-        // Check if volume path exists
-        if !Path::new(volume_path).exists() {
-            info!("Volume path does not exist, creating: {}", volume_path);
-            fs::create_dir_all(volume_path).await?;
-            return Ok(());
-        }
-
-        // Clear all files in the volume directory (but keep the directory itself)
-        let output = Command::new("sh")
+    async fn clear_workspace(&self, container_id: &str) -> anyhow::Result<()> {
+        // Clear all files in workspace directory
+        let output = Command::new("docker")
             .args(&[
-                "-c",
-                &format!("cd '{}' && rm -rf * .[!.]* ..?* 2>/dev/null || true", volume_path)
+                "exec",
+                container_id,
+                "sh", "-c",
+                "cd /workspace && rm -rf * .* 2>/dev/null || true"
             ])
             .output()
             .await?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                warn!("Workspace clear had warnings: {}", stderr);
-            }
+            warn!("Workspace clear had warnings: {}", String::from_utf8_lossy(&output.stderr));
         }
 
-        debug!("Cleared workspace directory at {}", volume_path);
+        debug!("Cleared workspace directory");
         Ok(())
     }
 
-    async fn extract_workspace_archive_direct(&self, volume_path: &str, archive_path: &str) -> anyhow::Result<()> {
-        // Check if archive exists
-        if !Path::new(archive_path).exists() {
-            return Err(anyhow::anyhow!("Archive does not exist: {}", archive_path));
+    async fn extract_workspace_archive(&self, container_id: &str, archive_path: &str) -> anyhow::Result<()> {
+        // Read archive file
+        let archive_data = fs::read(archive_path).await?;
+        
+        if archive_data.is_empty() {
+            debug!("Archive is empty, nothing to extract");
+            return Ok(());
         }
 
-        // Ensure volume directory exists
-        if !Path::new(volume_path).exists() {
-            fs::create_dir_all(volume_path).await?;
-        }
-
-        // Extract tar archive directly to host filesystem
-        let output = Command::new("tar")
+        // Create temporary file in container and extract
+        let temp_archive = "/tmp/restore_archive.tar.gz";
+        
+        // Copy archive to container
+        let mut child = Command::new("docker")
             .args(&[
-                "-xzf",
-                archive_path,
-                "-C",
-                volume_path
+                "exec", "-i",
+                container_id,
+                "sh", "-c",
+                &format!("cat > {}", temp_archive)
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(&archive_data).await?;
+            stdin.flush().await?;
+        }
+
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to copy archive to container: {}", 
+                String::from_utf8_lossy(&output.stderr)));
+        }
+
+        // Extract archive in workspace
+        let output = Command::new("docker")
+            .args(&[
+                "exec",
+                container_id,
+                "sh", "-c",
+                &format!("cd /workspace && tar -xzf {} && rm {}", temp_archive, temp_archive)
             ])
             .output()
             .await?;
@@ -299,7 +310,7 @@ impl SnapshotManager {
                 String::from_utf8_lossy(&output.stderr)));
         }
 
-        debug!("Extracted workspace archive to {}", volume_path);
+        debug!("Extracted workspace archive");
         Ok(())
     }
 }
