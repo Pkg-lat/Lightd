@@ -787,3 +787,374 @@ pub async fn upload_file(
     
     Ok(Json(ApiResponse::success(format!("Uploaded {} file(s): {}", uploaded_files.len(), uploaded_files.join(", ")))))
 }
+
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use chrono::{DateTime, Utc, Duration};
+use uuid::Uuid;
+use serde::{Serialize, Deserialize};
+use axum::body::Body;
+use axum::response::Response;
+use tokio_util::io::ReaderStream;
+
+/// One-time file token for direct upload/download
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileToken {
+    pub token: String,
+    pub container_uuid: String,
+    pub path: String,
+    pub operation: FileOperation,
+    pub expires_at: DateTime<Utc>,
+    pub used: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FileOperation {
+    Upload,
+    Download,
+}
+
+/// Token store for file operations
+#[derive(Default)]
+pub struct FileTokenStore {
+    tokens: RwLock<HashMap<String, FileToken>>,
+}
+
+impl FileTokenStore {
+    pub fn new() -> Self {
+        Self {
+            tokens: RwLock::new(HashMap::new()),
+        }
+    }
+    
+    /// Generate a new file token
+    pub async fn generate_token(&self, container_uuid: &str, path: &str, operation: FileOperation, ttl_seconds: i64) -> FileToken {
+        let token = Uuid::new_v4().to_string();
+        let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+        
+        let file_token = FileToken {
+            token: token.clone(),
+            container_uuid: container_uuid.to_string(),
+            path: path.to_string(),
+            operation,
+            expires_at,
+            used: false,
+        };
+        
+        let mut tokens = self.tokens.write().await;
+        tokens.insert(token.clone(), file_token.clone());
+        
+        file_token
+    }
+    
+    /// Validate and consume a token (one-time use)
+    pub async fn validate_and_consume(&self, token: &str, expected_operation: FileOperation) -> Option<FileToken> {
+        let mut tokens = self.tokens.write().await;
+        
+        if let Some(file_token) = tokens.get_mut(token) {
+            // Check if expired
+            if file_token.expires_at < Utc::now() {
+                tokens.remove(token);
+                return None;
+            }
+            
+            // Check if already used
+            if file_token.used {
+                return None;
+            }
+            
+            // Check operation type
+            if file_token.operation != expected_operation {
+                return None;
+            }
+            
+            // Mark as used and return
+            file_token.used = true;
+            let result = file_token.clone();
+            
+            // Remove the token after use
+            tokens.remove(token);
+            
+            return Some(result);
+        }
+        
+        None
+    }
+    
+    /// Clean up expired tokens
+    pub async fn cleanup_expired(&self) {
+        let mut tokens = self.tokens.write().await;
+        let now = Utc::now();
+        tokens.retain(|_, t| t.expires_at > now && !t.used);
+    }
+}
+
+/// Request for generating upload/download token
+#[derive(Debug, Deserialize)]
+pub struct GenerateTokenRequest {
+    pub path: String,
+}
+
+/// Response with direct URL
+#[derive(Debug, Serialize)]
+pub struct DirectUrlResponse {
+    pub url: String,
+    pub token: String,
+    pub expires_at: String,
+}
+
+/// Query params for public upload/download
+#[derive(Debug, Deserialize)]
+pub struct PublicTokenQuery {
+    pub token: String,
+}
+
+
+
+/// Generate an upload token for direct file upload
+pub async fn generate_upload_token(
+    State(state): State<AppState>,
+    Path(container_id): Path<String>,
+    Json(req): Json<GenerateTokenRequest>,
+) -> Result<Json<ApiResponse<DirectUrlResponse>>, StatusCode> {
+    // Check if container is locked
+    if let Some(lock_msg) = check_container_locked_for_fs(&state, &container_id) {
+        return Ok(Json(ApiResponse::error(lock_msg)));
+    }
+    
+    // Resolve to UUID
+    let uuid = resolve_container_to_uuid(&state, &container_id).await;
+    
+    // Generate token (valid for 5 minutes)
+    let token = state.file_tokens.generate_token(&uuid, &req.path, FileOperation::Upload, 300).await;
+    
+    // Build direct URL using the configured FQDN or fallback to localhost
+    let fqdn = state.config.server.fqdn.clone()
+        .unwrap_or_else(|| format!("{}:{}", state.config.server.host, state.config.server.port));
+    
+    let scheme = if state.config.server.https.unwrap_or(false) { "https" } else { "http" };
+    let url = format!("{}://{}/api/public/upload?token={}", scheme, fqdn, token.token);
+    
+    info!("Generated upload token for container {} path {}", uuid, req.path);
+    
+    Ok(Json(ApiResponse::success(DirectUrlResponse {
+        url,
+        token: token.token,
+        expires_at: token.expires_at.to_rfc3339(),
+    })))
+}
+
+/// Generate a download token for direct file download
+pub async fn generate_download_token(
+    State(state): State<AppState>,
+    Path(container_id): Path<String>,
+    Json(req): Json<GenerateTokenRequest>,
+) -> Result<Json<ApiResponse<DirectUrlResponse>>, StatusCode> {
+    // Resolve to UUID
+    let uuid = resolve_container_to_uuid(&state, &container_id).await;
+    
+    // Generate token (valid for 5 minutes)
+    let token = state.file_tokens.generate_token(&uuid, &req.path, FileOperation::Download, 300).await;
+    
+    // Build direct URL using the configured FQDN or fallback to localhost
+    let fqdn = state.config.server.fqdn.clone()
+        .unwrap_or_else(|| format!("{}:{}", state.config.server.host, state.config.server.port));
+    
+    let scheme = if state.config.server.https.unwrap_or(false) { "https" } else { "http" };
+    let url = format!("{}://{}/api/public/download?token={}", scheme, fqdn, token.token);
+    
+    info!("Generated download token for container {} path {}", uuid, req.path);
+    
+    Ok(Json(ApiResponse::success(DirectUrlResponse {
+        url,
+        token: token.token,
+        expires_at: token.expires_at.to_rfc3339(),
+    })))
+}
+
+/// Public upload endpoint - no auth required, uses one-time token
+pub async fn public_upload(
+    State(state): State<AppState>,
+    Query(query): Query<PublicTokenQuery>,
+    mut multipart: Multipart,
+) -> Result<Json<ApiResponse<String>>, StatusCode> {
+    // Validate and consume token
+    let file_token = match state.file_tokens.validate_and_consume(&query.token, FileOperation::Upload).await {
+        Some(t) => t,
+        None => {
+            error!("Invalid or expired upload token: {}", query.token);
+            return Ok(Json(ApiResponse::error("Invalid or expired token".to_string())));
+        }
+    };
+    
+    let uuid = file_token.container_uuid;
+    let target_path = file_token.path;
+    
+    info!("Public upload to container {} path {} via token", uuid, target_path);
+    
+    let mut uploaded_files = Vec::new();
+    
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        error!("Failed to read multipart field: {}", e);
+        StatusCode::BAD_REQUEST
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        
+        if name == "file" || name == "files" {
+            let file_name = field.file_name().unwrap_or("uploaded_file").to_string();
+            
+            // Convert target path to backend path
+            let backend_dir = if target_path == "/" || target_path.is_empty() {
+                "/home/container".to_string()
+            } else if target_path.starts_with("/home/container") {
+                target_path.clone()
+            } else if target_path.starts_with('/') {
+                format!("/home/container{}", target_path)
+            } else {
+                format!("/home/container/{}", target_path)
+            };
+            
+            let file_path = format!("{}/{}", backend_dir.trim_end_matches('/'), file_name);
+            
+            info!("Streaming file {} to {} in container {}", file_name, file_path, uuid);
+            
+            let volumes_path = state.config.storage.volumes_path.clone();
+            let uuid_clone = uuid.clone();
+            let file_path_clone = file_path.clone();
+            let file_name_clone = file_name.clone();
+            
+            // Collect chunks into a buffer (streaming from multipart)
+            let mut chunks = Vec::new();
+            let mut total_bytes = 0u64;
+            
+            while let Some(chunk) = field.chunk().await.map_err(|e| {
+                error!("Failed to read chunk: {}", e);
+                StatusCode::BAD_REQUEST
+            })? {
+                total_bytes += chunk.len() as u64;
+                chunks.push(chunk);
+            }
+            
+            // Write all chunks to disk in a single blocking task
+            let write_result = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                
+                let manager = FilesystemManagerDirect::new(volumes_path);
+                let host_path = manager.get_volume_path(&uuid_clone, &file_path_clone)?;
+                
+                // Create parent directories if they don't exist
+                if let Some(parent) = host_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                
+                // Create file and write all chunks
+                let file = std::fs::File::create(&host_path)?;
+                let mut writer = std::io::BufWriter::new(file);
+                
+                for chunk in chunks {
+                    writer.write_all(&chunk)?;
+                }
+                
+                writer.flush()?;
+                
+                Ok::<(), anyhow::Error>(())
+            }).await;
+            
+            match write_result {
+                Ok(Ok(())) => {
+                    info!("Successfully uploaded {} ({} bytes)", file_name_clone, total_bytes);
+                    uploaded_files.push(file_name_clone);
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to write file {}: {}", file_name, e);
+                    return Ok(Json(ApiResponse::error(format!("Failed to upload {}: {}", file_name, e))));
+                }
+                Err(e) => {
+                    error!("Task panicked during file write: {}", e);
+                    return Ok(Json(ApiResponse::error("Internal server error".to_string())));
+                }
+            }
+        }
+    }
+    
+    if uploaded_files.is_empty() {
+        return Ok(Json(ApiResponse::error("No files uploaded".to_string())));
+    }
+    
+    Ok(Json(ApiResponse::success(format!("Uploaded {} file(s): {}", uploaded_files.len(), uploaded_files.join(", ")))))
+}
+
+/// Public download endpoint - no auth required, uses one-time token
+pub async fn public_download(
+    State(state): State<AppState>,
+    Query(query): Query<PublicTokenQuery>,
+) -> Result<Response, StatusCode> {
+    // Validate and consume token
+    let file_token = match state.file_tokens.validate_and_consume(&query.token, FileOperation::Download).await {
+        Some(t) => t,
+        None => {
+            error!("Invalid or expired download token: {}", query.token);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    
+    let uuid = file_token.container_uuid;
+    let file_path = file_token.path;
+    
+    info!("Public download from container {} path {} via token", uuid, file_path);
+    
+    // Convert frontend path to backend path
+    let backend_path = if file_path == "/" || file_path.is_empty() {
+        "/home/container".to_string()
+    } else if file_path.starts_with("/home/container") {
+        file_path.clone()
+    } else if file_path.starts_with('/') {
+        format!("/home/container{}", file_path)
+    } else {
+        format!("/home/container/{}", file_path)
+    };
+    
+    let volumes_path = state.config.storage.volumes_path.clone();
+    let uuid_clone = uuid.clone();
+    let path_clone = backend_path.clone();
+    
+    // Get the full file path on disk (use main volume, not _data)
+    let full_path = format!("{}/{}{}", volumes_path, uuid_clone, path_clone.trim_start_matches("/home/container"));
+    
+    // Open file for streaming
+    let file = match tokio::fs::File::open(&full_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open file {}: {}", full_path, e);
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
+    
+    // Get file metadata for content-length
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to get file metadata: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    
+    // Extract filename for Content-Disposition
+    let filename = file_path.split('/').last().unwrap_or("download");
+    
+    // Stream the file
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", metadata.len())
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(response)
+}

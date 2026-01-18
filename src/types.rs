@@ -13,7 +13,6 @@ use crate::{
     websocket::TokenManager,
     services::{PowerActionService, PowerExecutor, ContainerEventHub, AsyncPowerManager, ContainerLifecycleManager},
     firewall::FirewallManager,
-    handlers::filesystem::FileTokenStore,
 };
 use tokio::sync::RwLock;
 
@@ -42,5 +41,5 @@ pub struct AppState {
     /// Firewall manager for per-container iptables rules
     pub firewall: Arc<FirewallManager>,
     /// File token store for direct upload/download
-    pub file_tokens: Arc<FileTokenStore>,
+    pub file_tokens: Arc<crate::handlers::filesystem::FileTokenStore>,
 }

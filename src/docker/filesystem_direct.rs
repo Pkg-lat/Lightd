@@ -151,7 +151,7 @@ impl FilesystemManagerDirect {
     /// /home/container is mounted to {volumes_path}/{container_id} (user data)
     /// /app/data is mounted to {volumes_path}/{container_id}_data (entrypoint, read-only)
     /// We only work with /home/container mount
-    fn get_volume_path(&self, container_id: &str, container_path: &str) -> anyhow::Result<PathBuf> {
+    pub fn get_volume_path(&self, container_id: &str, container_path: &str) -> anyhow::Result<PathBuf> {
         // Container's /home/container is stored at {volumes_path}/{container_id} (NOT _data!)
         let volume_root = PathBuf::from(&self.volumes_base_path)
             .join(container_id);
@@ -376,6 +376,25 @@ impl FilesystemManagerDirect {
         file.write_all(content)?;
         
         Ok(())
+    }
+
+    /// Read file content as bytes (for binary downloads)
+    pub fn get_file_bytes(&self, container_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        info!("Reading file (bytes) {} in container {}", path, container_id);
+        
+        let host_path = self.get_volume_path(container_id, path)?;
+        
+        if !host_path.exists() {
+            return Err(anyhow::anyhow!("File does not exist"));
+        }
+        
+        if !host_path.is_file() {
+            return Err(anyhow::anyhow!("Path is not a file"));
+        }
+        
+        let content = fs::read(&host_path)?;
+        
+        Ok(content)
     }
 
     /// Copy a file (byte-safe).
