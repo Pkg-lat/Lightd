@@ -160,6 +160,7 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits: new_limits,
             install_content: None,
+            runtime: tracker.runtime.clone(),
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -504,6 +505,7 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits,
             install_content: None,
+            runtime: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -663,6 +665,7 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits: Some(tracker.limits.clone()),
             install_content: None,
+            runtime: tracker.runtime.clone(),
         };
 
         let (new_container_id, allocations) = manager.create_with_networking(
@@ -923,6 +926,7 @@ impl ContainerLifecycleManager {
             custom_uuid: Some(uuid.to_string()),
             limits: Some(tracker.limits.clone()),
             install_content: None,
+            runtime: tracker.runtime.clone(),
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {

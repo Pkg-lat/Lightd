@@ -20,6 +20,8 @@ pub enum ContainerEvent {
     Stats(EventContainerStats),
     /// Console output from container
     ConsoleOutput { line: String },
+    /// Duplicate console output (resource efficient - just send count)
+    ConsoleDuplicate { count: u32 },
     /// Daemon message
     DaemonMessage { message: String },
     /// Power action started
@@ -132,6 +134,13 @@ impl ContainerEventHub {
     pub async fn broadcast_console(&self, container_id: &str, line: &str) {
         self.broadcast(container_id, ContainerEvent::ConsoleOutput {
             line: line.to_string(),
+        }).await;
+    }
+
+    /// Broadcast duplicate console output (just the count)
+    pub async fn broadcast_console_duplicate(&self, container_id: &str, count: u32) {
+        self.broadcast(container_id, ContainerEvent::ConsoleDuplicate {
+            count,
         }).await;
     }
 

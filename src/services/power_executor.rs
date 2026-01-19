@@ -87,7 +87,7 @@ impl PowerExecutor {
             }
         };
         
-        while let Some((cmd, action_id)) = rx.recv().await {
+        while let Some((cmd, _action_id)) = rx.recv().await {
             let docker = docker.clone();
             let callback = state_callback.clone();
             let pending = pending_actions.clone();
@@ -376,7 +376,7 @@ impl PowerExecutor {
         let action_id = uuid::Uuid::new_v4().to_string();
         
         // Check if container already has pending action
-        let container_id = match &cmd {
+        let _container_id = match &cmd {
             PowerCommand::Start { container_id, .. } => container_id,
             PowerCommand::Stop { container_id, .. } => container_id,
             PowerCommand::Kill { container_id, .. } => container_id,

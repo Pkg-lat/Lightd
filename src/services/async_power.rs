@@ -508,9 +508,10 @@ impl AsyncPowerManager {
         }
     }
 
-    /// Docker kill - SIGTERM (graceful signal)
+    /// Docker kill - SIGKILL (immediate termination)
+    /// This is the ONLY way to force stop a container immediately
     async fn do_docker_kill(docker: &Docker, container_id: &str) -> Result<(), String> {
-        let opts = KillContainerOptions { signal: "SIGTERM" };
+        let opts = KillContainerOptions { signal: "SIGKILL" };
         
         match tokio::time::timeout(
             Duration::from_secs(5),

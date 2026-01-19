@@ -151,6 +151,10 @@ impl WebSocketHandler {
                             let msg = WsMessage::console_output(&line).to_json();
                             if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                         }
+                        Ok(ContainerEvent::ConsoleDuplicate { count }) => {
+                            let msg = WsMessage::console_duplicate(count).to_json();
+                            if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
+                        }
                         Ok(ContainerEvent::Stats(stats)) => {
                             let msg = WsMessage::stats(
                                 stats.memory_bytes, stats.memory_limit_bytes, stats.cpu_percent,
@@ -366,6 +370,8 @@ impl WebSocketHandler {
         mut input_rx: mpsc::UnboundedReceiver<String>,
     ) {
             let mut backoff = Duration::from_millis(250);
+            let mut last_line: Option<String> = None;
+            let mut duplicate_count: u32 = 0;
 
             loop {
                 if !is_container_running(&docker, &container_id).await {
@@ -421,6 +427,19 @@ impl WebSocketHandler {
                                             for line in message.lines() {
                                                 let line = line.trim_end();
                                                 if !line.is_empty() {
+                                                    // Duplicate detection
+                                                    if let Some(ref last) = last_line {
+                                                        if last == line {
+                                                            duplicate_count += 1;
+                                                            // Send duplicate event (just count, super efficient)
+                                                            event_hub.broadcast_console_duplicate(&container_id, duplicate_count).await;
+                                                            continue;
+                                                        }
+                                                    }
+                                                    
+                                                    // New unique line - reset duplicate tracking
+                                                    last_line = Some(line.to_string());
+                                                    duplicate_count = 1;
                                                     event_hub.broadcast_console(&container_id, line).await;
                                                 }
                                             }
@@ -509,6 +528,8 @@ impl WebSocketHandler {
         // In exec mode, we attach to the container's main process
         // This gives us direct stdin/stdout access
         let mut backoff = Duration::from_millis(250);
+        let mut last_line: Option<String> = None;
+        let mut duplicate_count: u32 = 0;
         
         loop {
             if !is_container_running(&docker, &container_id).await {
@@ -547,6 +568,19 @@ impl WebSocketHandler {
                                 for line in message.lines() {
                                     let line = line.trim_end();
                                     if !line.is_empty() {
+                                        // Duplicate detection
+                                        if let Some(ref last) = last_line {
+                                            if last == line {
+                                                duplicate_count += 1;
+                                                // Send duplicate event (just count, super efficient)
+                                                event_hub.broadcast_console_duplicate(&container_id, duplicate_count).await;
+                                                continue;
+                                            }
+                                        }
+                                        
+                                        // New unique line - reset duplicate tracking
+                                        last_line = Some(line.to_string());
+                                        duplicate_count = 1;
                                         event_hub.broadcast_console(&container_id, line).await;
                                     }
                                 }

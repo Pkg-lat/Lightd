@@ -170,7 +170,7 @@ pub async fn get_container_mount(
     info!("Getting mount info for container: {}", container_uuid);
     
     // Check if container exists
-    let container_state = match state.state_manager.get_container(&container_uuid) {
+    let _container_state = match state.state_manager.get_container(&container_uuid) {
         Some(s) => s,
         None => return Ok(Json(ApiResponse::error(format!("Container {} not found", container_uuid)))),
     };
@@ -244,7 +244,7 @@ pub async fn swap_container_mount(
     }
     
     // Get current volume path
-    let tracker = match state.container_tracker.get_container(&container_uuid).await {
+    let _tracker = match state.container_tracker.get_container(&container_uuid).await {
         Ok(Some(t)) => t,
         Ok(None) => return Ok(Json(ApiResponse::error("Container tracker data not found".to_string()))),
         Err(e) => return Ok(Json(ApiResponse::error(format!("Failed to load container data: {}", e)))),

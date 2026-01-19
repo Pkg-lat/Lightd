@@ -1644,6 +1644,7 @@ async fn create_reinstall_container(
         custom_uuid: Some(uuid.to_string()),
         limits: req.limits.clone().or(Some(tracker.limits.clone())),
         install_content: None,
+        runtime: req.runtime.clone(),
     };
     
     let (new_container_id, allocations) = manager.create_with_networking(

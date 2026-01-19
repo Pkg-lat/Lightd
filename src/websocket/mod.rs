@@ -103,6 +103,14 @@ impl WsMessage {
         }
     }
 
+    /// Create console duplicate message (just the count)
+    pub fn console_duplicate(count: u32) -> Self {
+        Self {
+            event: WsEvent::ConsoleOutput,
+            args: vec![format!("x{}", count)],
+        }
+    }
+
     /// Create status message
     pub fn status(state: &str) -> Self {
         Self {

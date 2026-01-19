@@ -17,7 +17,7 @@ use crate::{
 /// Check if container is locked (installing/updating) - returns error message if locked
 fn check_container_locked_for_fs(state: &AppState, container_id: &str) -> Option<String> {
     // Try to find by container ID first
-    if let Some((uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
+    if let Some((_uuid, container_state)) = state.state_manager.find_by_container_id(container_id) {
         if container_state.locked.unwrap_or(false) {
             let reason = container_state.lock_reason.clone()
                 .unwrap_or_else(|| "Container is locked".to_string());
@@ -554,7 +554,7 @@ pub async fn extract_archive(
     info!("Extracting archive {} to {} in container {}", archive_backend, dest_backend, container_id);
     
     // Get the Docker container ID from UUID
-    let docker_container_id = match state.container_tracker.load_container(&container_id).await {
+    let _docker_container_id = match state.container_tracker.load_container(&container_id).await {
         Ok(info) => info.container_id,
         _ => container_id.clone(),
     };
@@ -672,7 +672,7 @@ pub async fn extract_zip(
     info!("Extracting zip {} to {} in container {}", zip_backend, dest_backend, container_id);
     
     // Get the Docker container ID from UUID
-    let docker_container_id = match state.container_tracker.load_container(&container_id).await {
+    let _docker_container_id = match state.container_tracker.load_container(&container_id).await {
         Ok(info) => info.container_id,
         _ => container_id.clone(),
     };
