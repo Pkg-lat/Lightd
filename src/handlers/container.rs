@@ -172,10 +172,14 @@ pub async fn create_container(
                 ports: req.ports.clone().unwrap_or_default(),
                 env: req.env.clone(),
                 status: "created".to_string(),
-                runtime: None,
+                runtime: req.runtime.clone(),
             };
             
             let _ = state.container_tracker.save_container(&tracker).await;
+
+            if let Some(runtime) = req.runtime.as_ref() {
+                state.async_power.set_runtime(&container_id, &runtime.start_up, &runtime.stop).await;
+            }
 
             // Spawn single background task for the entire lifecycle
             let bg_state = state.clone();
@@ -361,6 +365,7 @@ fn check_container_locked(state: &AppState, container_id: &str) -> Option<String
 
 /// Start a container (non-blocking, fire and forget)
 /// Accepts optional runtime config in request body for startup detection
+/// NO LOCKS - power actions never lock containers
 pub async fn start_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -368,7 +373,7 @@ pub async fn start_container(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Received start request for container: {}", id);
     
-    // Check if locked (installing/updating)
+    // Check if locked (installing/updating) - but NOT for power actions
     if let Some(lock_msg) = check_container_locked(&state, &id) {
         return Ok(Json(ApiResponse::error(lock_msg)));
     }
@@ -384,18 +389,19 @@ pub async fn start_container(
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
     
-    // First check if runtime was passed in request body
-    if let Some(Json(req)) = body {
-        if let Some(ref runtime) = req.runtime {
-            info!("Using runtime from request: start_up='{}', stop='{}'", runtime.start_up, runtime.stop);
+    // ALWAYS load runtime from tracker first (source of truth)
+    if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+        if let Some(ref runtime) = tracker.runtime {
+            info!("Loading runtime from tracker: start_up='{}', stop='{}'", runtime.start_up, runtime.stop);
             state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
         }
-    } else {
-        // Fall back to loading runtime config from tracker
-        if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
-            if let Some(ref runtime) = tracker.runtime {
-                state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
-            }
+    }
+    
+    // Allow request body to override (for testing/manual operations)
+    if let Some(Json(req)) = body {
+        if let Some(ref runtime) = req.runtime {
+            info!("Overriding runtime from request: start_up='{}', stop='{}'", runtime.start_up, runtime.stop);
+            state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
         }
     }
     
@@ -412,6 +418,7 @@ pub async fn start_container(
 
 /// Stop a container (non-blocking, fire and forget)
 /// Accepts optional runtime config in request body for graceful stop command
+/// NO LOCKS - power actions never lock containers
 pub async fn stop_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -419,7 +426,7 @@ pub async fn stop_container(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Received stop request for container: {}", id);
     
-    // Check if locked (installing/updating)
+    // Check if locked (installing/updating) - but NOT for power actions
     if let Some(lock_msg) = check_container_locked(&state, &id) {
         return Ok(Json(ApiResponse::error(lock_msg)));
     }
@@ -427,18 +434,19 @@ pub async fn stop_container(
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
     
-    // First check if runtime was passed in request body
-    if let Some(Json(req)) = body {
-        if let Some(ref runtime) = req.runtime {
-            info!("Using runtime from request: stop='{}', start_up='{}'", runtime.stop, runtime.start_up);
+    // ALWAYS load runtime from tracker first (source of truth)
+    if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+        if let Some(ref runtime) = tracker.runtime {
+            info!("Loading runtime from tracker: stop='{}', start_up='{}'", runtime.stop, runtime.start_up);
             state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
         }
-    } else {
-        // Fall back to loading runtime config from tracker
-        if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
-            if let Some(ref runtime) = tracker.runtime {
-                state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
-            }
+    }
+    
+    // Allow request body to override (for testing/manual operations)
+    if let Some(Json(req)) = body {
+        if let Some(ref runtime) = req.runtime {
+            info!("Overriding runtime from request: stop='{}', start_up='{}'", runtime.stop, runtime.start_up);
+            state.async_power.set_runtime(&id, &runtime.start_up, &runtime.stop).await;
         }
     }
     
@@ -1065,39 +1073,54 @@ pub async fn get_container_by_uuid(
             let name = container_state.name.clone();
             let image = container_state.image.clone();
             let cached_state = container_state.state.clone();
-            
+
             let special_states = ["install_failed", "installing", "suspended", "creating", "failed"];
             let actual_state = if special_states.contains(&cached_state.as_str()) {
                 cached_state
             } else {
+                let pending_action = state.async_power.has_pending_action(&container_id_clone).await;
+
                 // Query Docker with timeout
-                match tokio::time::timeout(
+                let docker_state = match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     state.docker.client().inspect_container(&container_id_clone, None)
                 ).await {
-                    Ok(Ok(info)) => {
-                        if let Some(docker_state) = info.state {
-                            if docker_state.oom_killed == Some(true) {
-                                "oom_killed".to_string()
-                            } else if docker_state.running == Some(true) {
-                                "running".to_string()
-                            } else if docker_state.paused == Some(true) {
-                                "paused".to_string()
-                            } else if docker_state.restarting == Some(true) {
-                                "restarting".to_string()
-                            } else if docker_state.dead == Some(true) {
-                                "dead".to_string()
-                            } else if docker_state.exit_code == Some(137) {
-                                "oom_killed".to_string()
+                    Ok(Ok(info)) => info.state,
+                    Ok(Err(_)) => None,
+                    Err(_) => None,
+                };
+
+                if let Some(action) = pending_action {
+                    match action.as_str() {
+                        "start" => "starting".to_string(),
+                        "stop" | "kill" => "stopping".to_string(),
+                        "restart" => {
+                            if docker_state.as_ref().and_then(|s| s.running).unwrap_or(false) {
+                                "stopping".to_string()
                             } else {
-                                "stopped".to_string()
+                                "starting".to_string()
                             }
-                        } else {
-                            "unknown".to_string()
                         }
+                        _ => "unknown".to_string(),
                     }
-                    Ok(Err(_)) => "offline".to_string(),
-                    Err(_) => "timeout".to_string(),
+                } else if let Some(docker_state) = docker_state {
+                    if docker_state.oom_killed == Some(true) {
+                        "oom_killed".to_string()
+                    } else if docker_state.running == Some(true) {
+                        "running".to_string()
+                    } else if docker_state.paused == Some(true) {
+                        "paused".to_string()
+                    } else if docker_state.restarting == Some(true) {
+                        "restarting".to_string()
+                    } else if docker_state.dead == Some(true) {
+                        "dead".to_string()
+                    } else if docker_state.exit_code == Some(137) {
+                        "oom_killed".to_string()
+                    } else {
+                        "stopped".to_string()
+                    }
+                } else {
+                    "unknown".to_string()
                 }
             };
             

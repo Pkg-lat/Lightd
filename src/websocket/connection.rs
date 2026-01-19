@@ -556,6 +556,13 @@ impl WebSocketConnection {
                                             )).await;
                                         }
                                     }
+                                    super::WsClientMessage::SetMode(_args) => {
+                                        // Mode switching is only supported in handler.rs (event hub based)
+                                        // connection.rs uses the simpler log streaming approach
+                                        let _ = tx.send(Message::Text(
+                                            WsMessage::daemon_message("Mode switching not supported in this WebSocket implementation. Use the event hub based connection.").to_json()
+                                        )).await;
+                                    }
                                     super::WsClientMessage::Ping => {
                                         // Just a keepalive, no response needed
                                     }

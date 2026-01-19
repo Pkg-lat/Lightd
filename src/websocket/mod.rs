@@ -41,6 +41,22 @@ pub enum WsEvent {
     CommandSent,
 }
 
+/// WebSocket connection mode
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WsMode {
+    /// Attached to container's main process (PID 1) - direct stdin/stdout
+    Attached,
+    /// Exec mode - runs commands via docker exec in a shell
+    Exec,
+}
+
+impl Default for WsMode {
+    fn default() -> Self {
+        Self::Attached
+    }
+}
+
 /// Client -> Server message types
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "event", content = "args")]
@@ -51,6 +67,9 @@ pub enum WsClientMessage {
     /// Power action (start, stop, restart, kill)
     #[serde(rename = "power")]
     Power(Vec<String>),
+    /// Switch WebSocket mode (attached/exec)
+    #[serde(rename = "set_mode")]
+    SetMode(Vec<String>),
     /// Ping/keepalive
     #[serde(rename = "ping")]
     Ping,
@@ -106,6 +125,14 @@ impl WsMessage {
         Self {
             event: WsEvent::DaemonMessage,
             args: vec!["[Lightd] ".to_string() + msg],
+        }
+    }
+    
+    /// Create mode changed message
+    pub fn mode_changed(mode: &str) -> Self {
+        Self {
+            event: WsEvent::DaemonMessage,
+            args: vec![format!("[Lightd] WebSocket mode changed to: {}", mode)],
         }
     }
 

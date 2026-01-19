@@ -5,20 +5,20 @@
 //! Uses lock-free state manager for status queries.
 
 use axum::extract::ws::{Message, WebSocket};
-use bollard::container::{LogOutput, LogsOptions, StatsOptions};
+use bollard::container::{LogOutput, LogsOptions, StatsOptions, AttachContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use chrono::{DateTime, FixedOffset};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::broadcast;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn, error};
 
 use crate::types::AppState;
 use crate::services::{ContainerEvent, ContainerEventHub, EventContainerStats};
-use super::{WebSocketToken, WsMessage};
+use super::{WebSocketToken, WsMessage, WsMode};
 
 #[derive(Debug, Deserialize)]
 struct ClientMessage {
@@ -26,22 +26,6 @@ struct ClientMessage {
     args: Vec<String>,
 }
 
-#[inline]
-fn docker_since(secs_ago: u64) -> i64 {
-    SystemTime::now()
-        .checked_sub(Duration::from_secs(secs_ago))
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[inline]
-fn epoch_secs_now() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 async fn is_container_running(docker: &bollard::Docker, container_id: &str) -> bool {
     match tokio::time::timeout(Duration::from_secs(2), docker.inspect_container(container_id, None)).await {
@@ -61,57 +45,31 @@ fn parse_docker_timestamp_prefix(line: &str) -> (Option<i64>, &str) {
     }
 }
 
-struct RecentDedupe {
-    set: HashSet<String>,
-    order: VecDeque<String>,
-    max: usize,
-}
-
-impl RecentDedupe {
-    fn new(max: usize) -> Self {
-        Self {
-            set: HashSet::with_capacity(max.min(2048)),
-            order: VecDeque::with_capacity(max.min(2048)),
-            max,
-        }
-    }
-
-    fn seen_or_insert(&mut self, key: String) -> bool {
-        if self.set.contains(&key) {
-            return true;
-        }
-
-        self.set.insert(key.clone());
-        self.order.push_back(key);
-
-        while self.order.len() > self.max {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
-        }
-
-        false
-    }
-}
 
 pub struct WebSocketHandler {
     token: WebSocketToken,
     socket: WebSocket,
     state: Arc<AppState>,
+    mode: WsMode,
 }
 
 impl WebSocketHandler {
     pub fn new(token: WebSocketToken, socket: WebSocket, state: Arc<AppState>) -> Self {
-        Self { token, socket, state }
+        Self { 
+            token, 
+            socket, 
+            state,
+            mode: WsMode::default(), // Default to attached mode
+        }
     }
 
-    pub async fn handle(self) {
+    pub async fn handle(mut self) {
         let container_id = self.token.container_id.clone();
         let container_uuid = self.token.container_uuid.clone();
         let docker = Arc::new(self.state.docker.client.clone());
         let event_hub = self.state.event_hub.clone();
 
-        info!("WebSocket opened for container: {} ({})", container_uuid, container_id);
+        info!("WebSocket opened for container: {} ({}) in {:?} mode", container_uuid, container_id, self.mode);
 
         let (mut ws_tx, mut ws_rx) = self.socket.split();
 
@@ -122,19 +80,27 @@ impl WebSocketHandler {
         let current_status = Self::get_container_status(&docker, &container_id).await;
         let is_running = current_status == "running";
 
-        // Send init message
+        // Send init message with mode info
         let init_msg = WsMessage::init(&container_id, &container_uuid, &current_status);
         if ws_tx.send(Message::Text(init_msg.to_json())).await.is_err() {
             warn!("Failed to send init message");
             event_hub.unsubscribe(&container_id).await;
             return;
         }
+        
+        // Notify client of current mode
+        let mode_msg = WsMessage::mode_changed(match self.mode {
+            WsMode::Attached => "attached",
+            WsMode::Exec => "exec",
+        });
+        let _ = ws_tx.send(Message::Text(mode_msg.to_json())).await;
 
         // Start streaming if running
-        let log_task = if is_running {
-            Some(Self::spawn_log_streamer(docker.clone(), container_id.clone(), event_hub.clone()))
+        let (log_task, attached_input_tx) = if is_running {
+            let (task, input_tx) = Self::spawn_log_streamer(docker.clone(), container_id.clone(), event_hub.clone(), self.mode);
+            (Some(task), input_tx)
         } else {
-            None
+            (None, None)
         };
 
         let stats_task = if is_running {
@@ -145,7 +111,13 @@ impl WebSocketHandler {
 
         let mut container_running = is_running;
         let mut current_log_task: Option<tokio::task::JoinHandle<()>> = log_task;
+        let mut attached_input_tx: Option<mpsc::UnboundedSender<String>> = attached_input_tx;
         let mut current_stats_task: Option<tokio::task::JoinHandle<()>> = stats_task;
+
+        // Send initial log tail on connect (always try, even if stopped)
+        if let Err(e) = Self::send_initial_logs(&docker, &container_id, &mut ws_tx).await {
+            debug!("Failed to send initial logs for {}: {}", container_id, e);
+        }
 
         loop {
             tokio::select! {
@@ -161,15 +133,18 @@ impl WebSocketHandler {
                             }
 
                             if container_running && !was_running {
-                                current_log_task = Some(Self::spawn_log_streamer(
-                                    docker.clone(), container_id.clone(), event_hub.clone(),
-                                ));
+                                let (task, input_tx) = Self::spawn_log_streamer(
+                                    docker.clone(), container_id.clone(), event_hub.clone(), self.mode,
+                                );
+                                current_log_task = Some(task);
+                                attached_input_tx = input_tx;
                                 current_stats_task = Some(Self::spawn_stats_streamer(
                                     docker.clone(), container_id.clone(), event_hub.clone(),
                                 ));
                             } else if !container_running && was_running {
                                 if let Some(task) = current_log_task.take() { task.abort(); }
                                 if let Some(task) = current_stats_task.take() { task.abort(); }
+                                attached_input_tx = None;
                             }
                         }
                         Ok(ContainerEvent::ConsoleOutput { line }) => {
@@ -211,19 +186,105 @@ impl WebSocketHandler {
                 msg = ws_rx.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                                if client_msg.event == "send_command" && !client_msg.args.is_empty() {
-                                    let cmd = &client_msg.args[0];
-                                    debug!("Executing command in {}: {}", container_id, cmd);
-                                    
-                                    let docker_clone = docker.clone();
-                                    let cid = container_id.clone();
-                                    let hub = event_hub.clone();
-                                    let command = cmd.clone();
-                                    
-                                    tokio::spawn(async move {
-                                        Self::execute_command(&docker_clone, &cid, &command, &hub).await;
-                                    });
+                            if let Ok(client_msg) = serde_json::from_str::<super::WsClientMessage>(&text) {
+                                match client_msg {
+                                    super::WsClientMessage::SendCommand(args) if !args.is_empty() => {
+                                        let cmd = &args[0];
+                                        debug!("Executing command in {} ({:?} mode): {}", container_id, self.mode, cmd);
+
+                                        match self.mode {
+                                            WsMode::Attached => {
+                                                if let Some(tx) = attached_input_tx.as_ref() {
+                                                    if tx.send(cmd.clone()).is_err() {
+                                                        let _ = ws_tx.send(Message::Text(
+                                                            WsMessage::error("Failed to send command to attached session").to_json()
+                                                        )).await;
+                                                    }
+                                                } else {
+                                                    let _ = ws_tx.send(Message::Text(
+                                                        WsMessage::error("No attached session available").to_json()
+                                                    )).await;
+                                                }
+                                            }
+                                            WsMode::Exec => {
+                                                let docker_clone = docker.clone();
+                                                let cid = container_id.clone();
+                                                let hub = event_hub.clone();
+                                                let command = cmd.clone();
+                                                
+                                                tokio::spawn(async move {
+                                                    Self::execute_command(&docker_clone, &cid, &command, &hub, WsMode::Exec).await;
+                                                });
+                                            }
+                                        }
+                                    }
+                                    super::WsClientMessage::Power(args) if !args.is_empty() => {
+                                        let action = args[0].to_lowercase();
+                                        let state = self.state.clone();
+                                        let cid = container_id.clone();
+                                        let uuid = container_uuid.clone();
+                                        let hub = event_hub.clone();
+
+                                        tokio::spawn(async move {
+                                            if let Ok(Some(tracker)) = state.container_tracker.get_container(&uuid).await {
+                                                if let Some(runtime) = tracker.runtime {
+                                                    state.async_power.set_runtime(&cid, &runtime.start_up, &runtime.stop).await;
+                                                }
+                                            }
+
+                                            let result = match action.as_str() {
+                                                "start" => state.async_power.start(cid.clone(), uuid.clone()).await,
+                                                "stop" => state.async_power.stop(cid.clone(), uuid.clone()).await,
+                                                "restart" => state.async_power.restart(cid.clone(), uuid.clone()).await,
+                                                "kill" => state.async_power.kill(cid.clone(), uuid.clone()).await,
+                                                _ => Err("Invalid power action".to_string()),
+                                            };
+
+                                            if let Err(err) = result {
+                                                hub.broadcast_message(&cid, &format!("Power action failed: {}", err)).await;
+                                            }
+                                        });
+                                    }
+                                    super::WsClientMessage::SetMode(args) if !args.is_empty() => {
+                                        let new_mode = match args[0].to_lowercase().as_str() {
+                                            "attached" => WsMode::Attached,
+                                            "exec" => WsMode::Exec,
+                                            _ => {
+                                                let _ = ws_tx.send(Message::Text(
+                                                    WsMessage::error("Invalid mode. Use 'attached' or 'exec'").to_json()
+                                                )).await;
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        if new_mode != self.mode {
+                                            info!("Switching WebSocket mode from {:?} to {:?} for {}", self.mode, new_mode, container_id);
+                                            self.mode = new_mode;
+                                            
+                                            // Restart log streamer with new mode
+                                            if container_running {
+                                                if let Some(task) = current_log_task.take() { 
+                                                    task.abort(); 
+                                                }
+                                                let (task, input_tx) = Self::spawn_log_streamer(
+                                                    docker.clone(), container_id.clone(), event_hub.clone(), self.mode,
+                                                );
+                                                current_log_task = Some(task);
+                                                attached_input_tx = input_tx;
+                                            } else {
+                                                attached_input_tx = None;
+                                            }
+                                            
+                                            let mode_str = match new_mode {
+                                                WsMode::Attached => "attached",
+                                                WsMode::Exec => "exec",
+                                            };
+                                            let _ = ws_tx.send(Message::Text(
+                                                WsMessage::mode_changed(mode_str).to_json()
+                                            )).await;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -278,180 +339,234 @@ impl WebSocketHandler {
         docker: Arc<bollard::Docker>,
         container_id: String,
         event_hub: Arc<ContainerEventHub>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            // Keep trying to stream logs. Docker log streams can end/error during
-            // container crashes/restarts; this loop reconnects without requiring
-            // a separate state-change event.
+        mode: WsMode,
+    ) -> (tokio::task::JoinHandle<()>, Option<mpsc::UnboundedSender<String>>) {
+        match mode {
+            WsMode::Attached => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let task = tokio::spawn(async move {
+                    Self::stream_logs_attached(docker, container_id, event_hub, rx).await;
+                });
+                (task, Some(tx))
+            }
+            WsMode::Exec => {
+                let task = tokio::spawn(async move {
+                    Self::stream_logs_exec(docker, container_id, event_hub).await;
+                });
+                (task, None)
+            }
+        }
+    }
+    
+    /// Stream logs in attached mode - uses docker.logs() API
+    async fn stream_logs_attached(
+        docker: Arc<bollard::Docker>,
+        container_id: String,
+        event_hub: Arc<ContainerEventHub>,
+        mut input_rx: mpsc::UnboundedReceiver<String>,
+    ) {
             let mut backoff = Duration::from_millis(250);
-            // Start slightly in the past to avoid missing immediate-exit output.
-            let mut last_since = docker_since(5);
-
-            let mut last_tail_poll: Option<SystemTime> = None;
-            let mut stopped_tail_sent = false;
-            let mut running_tail_sent = false;
-            let mut recent = RecentDedupe::new(1024);
 
             loop {
-                let running = is_container_running(&docker, &container_id).await;
-                if running {
-                    stopped_tail_sent = false;
-                } else {
-                    running_tail_sent = false;
-                }
-                if !running {
-                    let should_poll = match last_tail_poll {
-                        None => true,
-                        Some(t) => t.elapsed().unwrap_or(Duration::from_secs(0)) >= Duration::from_secs(1),
-                    };
-
-                    if should_poll {
-                        // Only include a tail once per stopped period; afterwards tail=0
-                        // to avoid re-sending the same last lines repeatedly.
-                        let tail = if stopped_tail_sent { "0" } else { "200" };
-                        // One-shot pull of recent logs, constrained by `since` and `tail`.
-                        let opts = LogsOptions::<String> {
-                            follow: false,
-                            stdout: true,
-                            stderr: true,
-                            since: (last_since - 1).max(0),
-                            timestamps: true,
-                            tail: tail.to_string(),
-                            ..Default::default()
-                        };
-
-                        let mut poll_stream = docker.logs(&container_id, Some(opts));
-                        while let Some(result) = poll_stream.next().await {
-                            match result {
-                                Ok(log_output) => {
-                                    last_tail_poll = Some(SystemTime::now());
-
-                                    let message_bytes = match log_output {
-                                        LogOutput::StdOut { message } |
-                                        LogOutput::StdErr { message } |
-                                        LogOutput::Console { message } |
-                                        LogOutput::StdIn { message } => message,
-                                    };
-                                    let message = String::from_utf8_lossy(&message_bytes);
-                                    for line in message.lines() {
-                                        let line = line.trim();
-                                        if line.is_empty() {
-                                            continue;
-                                        }
-
-                                        let (ts, content) = parse_docker_timestamp_prefix(line);
-                                        if let Some(ts) = ts {
-                                            last_since = ts;
-                                        } else {
-                                            last_since = epoch_secs_now();
-                                        }
-
-                                        let content = content.trim();
-                                        if content.is_empty() {
-                                            continue;
-                                        }
-
-                                        let key = if let Some(ts) = ts {
-                                            format!("{}|{}", ts, content)
-                                        } else {
-                                            content.to_string()
-                                        };
-
-                                        if !recent.seen_or_insert(key) {
-                                            backoff = Duration::from_millis(250);
-                                            event_hub.broadcast_console(&container_id, content).await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Log poll error for {}: {}", container_id, e);
-                                    break;
-                                }
-                            }
-                        }
-
-                        stopped_tail_sent = true;
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                if !is_container_running(&docker, &container_id).await {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
 
-                // Running: follow logs. Only send a tail once per running period.
-                let tail = if running_tail_sent { "0" } else { "200" };
-                let opts = LogsOptions::<String> {
-                    follow: true,
-                    stdout: true,
-                    stderr: true,
-                    since: (last_since - 1).max(0),
-                    timestamps: true,
-                    tail: tail.to_string(),
+                let attach_opts = AttachContainerOptions::<String> {
+                    stdin: Some(true),
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(true),
                     ..Default::default()
                 };
 
-                let mut stream = docker.logs(&container_id, Some(opts));
-                let mut saw_any = false;
+                match docker.attach_container(&container_id, Some(attach_opts)).await {
+                    Ok(attached) => {
+                        info!("Attached to container {} in attached mode", container_id);
+                        backoff = Duration::from_millis(250);
 
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(log_output) => {
-                            saw_any = true;
-                            backoff = Duration::from_millis(250);
-                            last_tail_poll = Some(SystemTime::now());
+                        let mut output = attached.output;
+                        let mut input = attached.input;
 
-                            let message_bytes = match log_output {
-                                LogOutput::StdOut { message } |
-                                LogOutput::StdErr { message } |
-                                LogOutput::Console { message } |
-                                LogOutput::StdIn { message } => message,
-                            };
-
-                            let message = String::from_utf8_lossy(&message_bytes);
-                            for line in message.lines() {
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
+                        loop {
+                            tokio::select! {
+                                cmd = input_rx.recv() => {
+                                    match cmd {
+                                        Some(command) => {
+                                            let payload = format!("{}\n", command);
+                                            if let Err(e) = input.write_all(payload.as_bytes()).await {
+                                                debug!("Failed to write to attached stdin for {}: {}", container_id, e);
+                                                break;
+                                            }
+                                            let _ = input.flush().await;
+                                        }
+                                        None => {
+                                            return;
+                                        }
+                                    }
                                 }
+                                result = output.next() => {
+                                    match result {
+                                        Some(Ok(log_output)) => {
+                                            let message_bytes = match log_output {
+                                                LogOutput::StdOut { message } |
+                                                LogOutput::StdErr { message } |
+                                                LogOutput::Console { message } |
+                                                LogOutput::StdIn { message } => message,
+                                            };
 
-                                let (ts, content) = parse_docker_timestamp_prefix(line);
-                                if let Some(ts) = ts {
-                                    last_since = ts;
-                                } else {
-                                    last_since = epoch_secs_now();
-                                }
-
-                                let content = content.trim();
-                                if content.is_empty() {
-                                    continue;
-                                }
-
-                                let key = if let Some(ts) = ts {
-                                    format!("{}|{}", ts, content)
-                                } else {
-                                    content.to_string()
-                                };
-
-                                if !recent.seen_or_insert(key) {
-                                    event_hub.broadcast_console(&container_id, content).await;
+                                            let message = String::from_utf8_lossy(&message_bytes);
+                                            for line in message.lines() {
+                                                let line = line.trim_end();
+                                                if !line.is_empty() {
+                                                    event_hub.broadcast_console(&container_id, line).await;
+                                                }
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            debug!("Attach stream error for {}: {}", container_id, e);
+                                            break;
+                                        }
+                                        None => {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug!("Log stream error for {}: {}", container_id, e);
-                            break;
-                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to attach to container {}: {}", container_id, e);
                     }
                 }
 
-                if saw_any {
-                    running_tail_sent = true;
-                }
-
-                // Stream ended (or errored). Reconnect after a brief backoff.
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
-        })
+    }
+
+    async fn send_initial_logs(
+        docker: &bollard::Docker,
+        container_id: &str,
+        ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    ) -> Result<(), String> {
+        let opts = LogsOptions::<String> {
+            follow: false,
+            stdout: true,
+            stderr: true,
+            since: 0,
+            timestamps: true,
+            tail: "200".to_string(),
+            ..Default::default()
+        };
+
+        let mut stream = docker.logs(container_id, Some(opts));
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(log_output) => {
+                    let message_bytes = match log_output {
+                        LogOutput::StdOut { message } |
+                        LogOutput::StdErr { message } |
+                        LogOutput::Console { message } |
+                        LogOutput::StdIn { message } => message,
+                    };
+                    let message = String::from_utf8_lossy(&message_bytes);
+                    for line in message.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let (_, content) = parse_docker_timestamp_prefix(line);
+                        let content = content.trim();
+                        if content.is_empty() {
+                            continue;
+                        }
+                        let msg = WsMessage::console_output(content).to_json();
+                        if ws_tx.send(Message::Text(msg)).await.is_err() {
+                            return Err("client disconnected".to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e.to_string());
+                }
+            }
+        }
+
+        Ok(())
+    }
+    
+    /// Stream logs in exec mode - attaches to container's main process (PID 1)
+    async fn stream_logs_exec(
+        docker: Arc<bollard::Docker>,
+        container_id: String,
+        event_hub: Arc<ContainerEventHub>,
+    ) {
+        info!("Starting exec mode log streamer for {}", container_id);
+        
+        // In exec mode, we attach to the container's main process
+        // This gives us direct stdin/stdout access
+        let mut backoff = Duration::from_millis(250);
+        
+        loop {
+            if !is_container_running(&docker, &container_id).await {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            
+            // Attach to container with stdin/stdout/stderr
+            let attach_opts = AttachContainerOptions::<String> {
+                stdin: Some(true),
+                stdout: Some(true),
+                stderr: Some(true),
+                stream: Some(true),
+                logs: Some(true),  // Get recent logs too
+                ..Default::default()
+            };
+            
+            match docker.attach_container(&container_id, Some(attach_opts)).await {
+                Ok(attached) => {
+                    info!("Attached to container {} in exec mode", container_id);
+                    backoff = Duration::from_millis(250);
+                    
+                    let mut output = attached.output;
+                    
+                    while let Some(result) = output.next().await {
+                        match result {
+                            Ok(log_output) => {
+                                let message_bytes = match log_output {
+                                    LogOutput::StdOut { message } |
+                                    LogOutput::StdErr { message } |
+                                    LogOutput::Console { message } |
+                                    LogOutput::StdIn { message } => message,
+                                };
+                                
+                                let message = String::from_utf8_lossy(&message_bytes);
+                                for line in message.lines() {
+                                    let line = line.trim_end();
+                                    if !line.is_empty() {
+                                        event_hub.broadcast_console(&container_id, line).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Attach stream error for {}: {}", container_id, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to attach to container {}: {}", container_id, e);
+                }
+            }
+            
+            // Reconnect after backoff
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
     }
 
     fn spawn_stats_streamer(
@@ -533,55 +648,66 @@ impl WebSocketHandler {
         container_id: &str,
         command: &str,
         event_hub: &ContainerEventHub,
+        mode: WsMode,
     ) {
-        let exec_config = CreateExecOptions {
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            cmd: Some(vec!["sh", "-c", command]),
-            ..Default::default()
-        };
+        match mode {
+            WsMode::Attached => {
+                // In attached mode, commands are sent directly to stdin
+                // This is handled by the attach stream, so we just broadcast the command
+                event_hub.broadcast_console(container_id, &format!("> {}", command)).await;
+            }
+            WsMode::Exec => {
+                // In exec mode, run command via docker exec
+                let exec_config = CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec!["sh", "-c", command]),
+                    ..Default::default()
+                };
 
-        match docker.create_exec(container_id, exec_config).await {
-            Ok(exec) => {
-                match docker.start_exec(&exec.id, None).await {
-                    Ok(StartExecResults::Attached { mut output, .. }) => {
-                        while let Some(result) = output.next().await {
-                            match result {
-                                Ok(log_output) => {
-                                    let message_bytes = match log_output {
-                                        LogOutput::StdOut { message } |
-                                        LogOutput::StdErr { message } |
-                                        LogOutput::Console { message } |
-                                        LogOutput::StdIn { message } => message,
-                                    };
+                match docker.create_exec(container_id, exec_config).await {
+                    Ok(exec) => {
+                        match docker.start_exec(&exec.id, None).await {
+                            Ok(StartExecResults::Attached { mut output, .. }) => {
+                                while let Some(result) = output.next().await {
+                                    match result {
+                                        Ok(log_output) => {
+                                            let message_bytes = match log_output {
+                                                LogOutput::StdOut { message } |
+                                                LogOutput::StdErr { message } |
+                                                LogOutput::Console { message } |
+                                                LogOutput::StdIn { message } => message,
+                                            };
 
-                                    let text = String::from_utf8_lossy(&message_bytes);
-                                    for line in text.lines() {
-                                        let line = line.trim_end();
-                                        if !line.is_empty() {
-                                            event_hub.broadcast_console(container_id, line).await;
+                                            let text = String::from_utf8_lossy(&message_bytes);
+                                            for line in text.lines() {
+                                                let line = line.trim_end();
+                                                if !line.is_empty() {
+                                                    event_hub.broadcast_console(container_id, line).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Exec output error for {}: {}", container_id, e);
+                                            break;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Exec output error for {}: {}", container_id, e);
-                                    break;
-                                }
+                            }
+                            Ok(StartExecResults::Detached) => {
+                                debug!("Exec started in detached mode for {}", container_id);
+                            }
+                            Err(e) => {
+                                error!("Failed to start exec for {}: {}", container_id, e);
+                                event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
                             }
                         }
                     }
-                    Ok(StartExecResults::Detached) => {
-                        debug!("Exec started in detached mode for {}", container_id);
-                    }
                     Err(e) => {
-                        error!("Failed to start exec for {}: {}", container_id, e);
+                        error!("Failed to create exec for {}: {}", container_id, e);
                         event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
                     }
                 }
-            }
-            Err(e) => {
-                error!("Failed to create exec for {}: {}", container_id, e);
-                event_hub.broadcast_console(container_id, &format!("Error: {}", e)).await;
             }
         }
     }

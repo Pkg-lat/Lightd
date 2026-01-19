@@ -18,6 +18,7 @@ use bollard::Docker;
 use bollard::container::{KillContainerOptions, AttachContainerOptions, LogsOptions};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
+use regex::Regex;
 
 use super::container_events::{ContainerEventHub, ContainerEvent};
 use crate::remote::Remote;
@@ -452,9 +453,17 @@ impl AsyncPowerManager {
         match docker.attach_container(container_id, Some(options)).await {
             Ok(attach_result) => {
                 let mut input = attach_result.input;
-                let cmd_with_newline = format!("{}\n", stop_cmd);
-                
-                if let Err(e) = input.write_all(cmd_with_newline.as_bytes()).await {
+                let trimmed = stop_cmd.trim();
+
+                let write_result = if trimmed.eq_ignore_ascii_case("^^c") || trimmed.eq_ignore_ascii_case("^c") {
+                    // Send Ctrl+C (SIGINT) to attached stdin
+                    input.write_all(&[0x03]).await
+                } else {
+                    let cmd_with_newline = format!("{}\n", stop_cmd);
+                    input.write_all(cmd_with_newline.as_bytes()).await
+                };
+
+                if let Err(e) = write_result {
                     warn!("Failed to send stop command: {}", e);
                 } else {
                     let _ = input.flush().await;
@@ -499,9 +508,9 @@ impl AsyncPowerManager {
         }
     }
 
-    /// Docker kill - instant SIGKILL like Pterodactyl Wings
+    /// Docker kill - SIGTERM (graceful signal)
     async fn do_docker_kill(docker: &Docker, container_id: &str) -> Result<(), String> {
-        let opts = KillContainerOptions { signal: "SIGKILL" };
+        let opts = KillContainerOptions { signal: "SIGTERM" };
         
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -521,6 +530,7 @@ impl AsyncPowerManager {
     }
 
     async fn wait_for_startup_log(docker: &Docker, container_id: &str, startup_str: &str, timeout_secs: u64) -> bool {
+        let startup_regex = Regex::new(startup_str).ok();
         let opts = LogsOptions::<String> {
             follow: true,
             stdout: true,
@@ -552,8 +562,16 @@ impl AsyncPowerManager {
                                 }
                             };
                             
-                            if message.contains(startup_str) {
-                                debug!("Found startup string '{}' in logs", startup_str);
+                            let cleaned = strip_ansi(&message);
+
+                            let matched = if let Some(ref re) = startup_regex {
+                                re.is_match(&cleaned)
+                            } else {
+                                cleaned.contains(startup_str)
+                            };
+
+                            if matched {
+                                debug!("Found startup pattern '{}' in logs", startup_str);
                                 return true;
                             }
                         }
@@ -570,4 +588,27 @@ impl AsyncPowerManager {
             }
         }
     }
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if let Some('[') = chars.peek().copied() {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        out.push(ch);
+    }
+
+    out
 }

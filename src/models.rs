@@ -18,6 +18,9 @@ pub struct CreateContainerRequest {
     pub limits: Option<ResourceLimits>,
     /// Install script - used during creation but not persisted to state/tracker
     pub install_content: Option<String>,
+    /// Runtime config for startup/stop behavior
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
