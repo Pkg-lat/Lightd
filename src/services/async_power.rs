@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug};
 use bollard::Docker;
@@ -178,21 +178,28 @@ impl AsyncPowerManager {
             let result = Self::do_start(&docker, &cid).await;
             
             if result.is_ok() {
-                // If we have a startup detection string, wait for it
-                if let Some(ref rt) = runtime {
+                let since = Self::get_container_started_at(&docker, &cid)
+                    .await
+                    .unwrap_or_else(Self::now_epoch_secs);
+
+                let detected = if let Some(ref rt) = runtime {
                     if !rt.start_up.is_empty() {
-                        info!("Watching logs for startup string: '{}'", rt.start_up);
-                        let detected = Self::wait_for_startup_log(&docker, &cid, &rt.start_up, 300).await;
-                        if detected {
-                            info!("Startup detected for container {} - server is running", cid);
-                        } else {
-                            warn!("Startup detection timed out for {}, assuming running", cid);
-                        }
+                        info!("Watching logs for startup pattern: '{}'", rt.start_up);
+                        Self::wait_for_startup_log(&docker, &cid, &rt.start_up, 300, since).await
+                    } else {
+                        true
                     }
+                } else {
+                    true
+                };
+
+                if detected {
+                    hub.broadcast_state(&cid, "running").await;
+                    Self::callback_state(&remote, &uid, "running").await;
+                } else {
+                    warn!("Startup pattern not detected for {}, leaving state as starting", cid);
+                    hub.broadcast_message(&cid, "Startup pattern not detected yet, still starting...").await;
                 }
-                // Container is now running
-                hub.broadcast_state(&cid, "running").await;
-                Self::callback_state(&remote, &uid, "running").await;
             } else {
                 hub.broadcast_state(&cid, "stopped").await;
                 Self::callback_state(&remote, &uid, "stopped").await;
@@ -387,13 +394,27 @@ impl AsyncPowerManager {
             let result = Self::do_start(&docker, &cid).await;
             
             if result.is_ok() {
-                if let Some(ref rt) = runtime {
+                let since = Self::get_container_started_at(&docker, &cid)
+                    .await
+                    .unwrap_or_else(Self::now_epoch_secs);
+
+                let detected = if let Some(ref rt) = runtime {
                     if !rt.start_up.is_empty() {
-                        let _ = Self::wait_for_startup_log(&docker, &cid, &rt.start_up, 300).await;
+                        Self::wait_for_startup_log(&docker, &cid, &rt.start_up, 300, since).await
+                    } else {
+                        true
                     }
+                } else {
+                    true
+                };
+
+                if detected {
+                    hub.broadcast_state(&cid, "running").await;
+                    Self::callback_state(&remote, &uid, "running").await;
+                } else {
+                    warn!("Startup pattern not detected for {}, leaving state as starting", cid);
+                    hub.broadcast_message(&cid, "Startup pattern not detected yet, still starting...").await;
                 }
-                hub.broadcast_state(&cid, "running").await;
-                Self::callback_state(&remote, &uid, "running").await;
             } else {
                 hub.broadcast_state(&cid, "stopped").await;
                 Self::callback_state(&remote, &uid, "stopped").await;
@@ -530,13 +551,43 @@ impl AsyncPowerManager {
         }
     }
 
-    async fn wait_for_startup_log(docker: &Docker, container_id: &str, startup_str: &str, timeout_secs: u64) -> bool {
-        let startup_regex = Regex::new(startup_str).ok();
+    fn now_epoch_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    async fn get_container_started_at(docker: &Docker, container_id: &str) -> Option<i64> {
+        docker
+            .inspect_container(container_id, None)
+            .await
+            .ok()
+            .and_then(|info| info.state)
+            .and_then(|s| s.started_at)
+            .and_then(|started| chrono::DateTime::parse_from_rfc3339(&started).ok())
+            .map(|dt| dt.timestamp())
+    }
+
+    async fn wait_for_startup_log(
+        docker: &Docker,
+        container_id: &str,
+        startup_str: &str,
+        timeout_secs: u64,
+        since: i64,
+    ) -> bool {
+        let startup_regex = match Regex::new(startup_str) {
+            Ok(re) => re,
+            Err(e) => {
+                debug!("Invalid startup regex '{}': {}", startup_str, e);
+                return false;
+            }
+        };
         let opts = LogsOptions::<String> {
             follow: true,
             stdout: true,
             stderr: true,
-            since: 0,
+            since,
             timestamps: false,
             tail: "0".to_string(),
             ..Default::default()
@@ -565,13 +616,7 @@ impl AsyncPowerManager {
                             
                             let cleaned = strip_ansi(&message);
 
-                            let matched = if let Some(ref re) = startup_regex {
-                                re.is_match(&cleaned)
-                            } else {
-                                cleaned.contains(startup_str)
-                            };
-
-                            if matched {
+                            if startup_regex.is_match(&cleaned) {
                                 debug!("Found startup pattern '{}' in logs", startup_str);
                                 return true;
                             }

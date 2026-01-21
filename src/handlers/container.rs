@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     docker::ContainerManager,
-    models::{ApiResponse, CreateContainerRequest, SuspendRequest, UnsuspendRequest, ContainerTracker, ResourceLimits, UpdateContainerRequest, UpdateLimitsRequest, InstallationStatus, ContainerLookupResponse, StopRequest, StartRequest},
+    models::{ApiResponse, CreateContainerRequest, SuspendRequest, UnsuspendRequest, ContainerTracker, UpdateContainerRequest, UpdateLimitsRequest, InstallationStatus, ContainerLookupResponse, StopRequest, StartRequest},
     types::AppState,
     container_tracker::ContainerTrackingManager,
     state_manager::ContainerState,
@@ -98,11 +98,21 @@ pub async fn create_container(
         lock_reason: None,
         locked_at: None,
         restart_policy: None,
+        operation: None,
+        operation_id: None,
+        operation_message: None,
     };
 
     // Add to state (lock-free)
     if let Err(e) = state.state_manager.add_container(&custom_uuid, container_state).await {
         error!("Failed to add container to daemon state: {}", e);
+    }
+
+    if let Some(request_id) = req.request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&custom_uuid, "creating", Some(request_id), Some("Creating container"))
+            .await;
     }
     
     let manager = ContainerManager::new(state.docker.client().clone());
@@ -153,8 +163,9 @@ pub async fn create_container(
             if let Some(remote) = &state.remote {
                 let remote = remote.clone();
                 let uuid = custom_uuid.clone();
+                let request_id = req.request_id.clone();
                 tokio::spawn(async move {
-                    remote.send_container_state(&uuid, "created").await;
+                    remote.send_container_state_with_id(&uuid, "created", request_id.as_deref()).await;
                 });
             }
 
@@ -174,7 +185,7 @@ pub async fn create_container(
                 status: "created".to_string(),
                 runtime: req.runtime.clone(),
             };
-            
+
             let _ = state.container_tracker.save_container(&tracker).await;
 
             if let Some(runtime) = req.runtime.as_ref() {
@@ -188,10 +199,11 @@ pub async fn create_container(
             let bg_entrypoint_path = entrypoint_path.clone();
             let bg_startup_cmd = startup_cmd.clone();
             let has_install = req.install_content.is_some();
-            
+
+            let request_id = req.request_id.clone();
             tokio::spawn(async move {
                 let manager = ContainerManager::new(bg_state.docker.client().clone());
-                
+
                 // Step 1: Start the container
                 info!("Background: Starting container {}", bg_container_id);
                 if let Err(e) = manager.start(&bg_container_id).await {
@@ -201,58 +213,57 @@ pub async fn create_container(
                     if let Some(remote) = &bg_state.remote {
                         let remote = remote.clone();
                         let uuid = bg_uuid.clone();
-                        tokio::spawn(async move { remote.send_container_state(&uuid, "failed").await });
+                        let request_id = request_id.clone();
+                        tokio::spawn(async move { remote.send_container_state_with_id(&uuid, "failed", request_id.as_deref()).await });
                     }
 
+                    let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
                     return;
                 }
-                
+
                 if has_install {
                     // Step 2: If has install script, wait for it to complete
                     let _ = bg_state.state_manager.update_container_state(&bg_uuid, "installing").await;
-                    // Notify remote about installing
                     if let Some(remote) = &bg_state.remote {
                         let remote = remote.clone();
                         let uuid = bg_uuid.clone();
-                        tokio::spawn(async move { remote.send_install_status(&uuid, "installing", None).await });
+                        let request_id = request_id.clone();
+                        tokio::spawn(async move { remote.send_install_status_with_container_id_and_id(&uuid, "installing", None, None, request_id.as_deref()).await });
                     }
 
                     let _ = bg_state.state_manager.lock_container(&bg_uuid, "Running install script").await;
-                    
+
                     info!("Background: Waiting for install script to complete for {}", bg_container_id);
                     let docker = bg_state.docker.client().clone();
-                    
+
                     // Wait up to 10 minutes for install to complete
                     let max_wait = 600;
                     let mut waited = 0;
-                    
+
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         waited += 2;
-                        
+
                         if waited > max_wait {
                             error!("Background: Install timed out for {}", bg_container_id);
                             let _ = bg_state.state_manager.update_container_state(&bg_uuid, "install_timeout").await;
                             let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
                             break;
                         }
-                        
+
                         match docker.inspect_container(&bg_container_id, None).await {
                             Ok(info) => {
                                 if let Some(state) = info.state {
                                     if state.running != Some(true) {
-                                        // Container stopped - install finished
                                         let exit_code = state.exit_code.unwrap_or(-1);
                                         info!("Background: Install finished for {} with exit code {}", bg_container_id, exit_code);
-                                        
+
                                         if exit_code == 0 {
-                                            // Step 3: Update entrypoint to startup command
                                             info!("Background: Updating entrypoint to startup command for {}", bg_container_id);
                                             if let Err(e) = tokio::fs::write(&bg_entrypoint_path, &bg_startup_cmd).await {
                                                 error!("Background: Failed to update entrypoint: {}", e);
                                             }
-                                            
-                                            // Step 4: Restart container with new entrypoint
+
                                             info!("Background: Restarting container {} with startup command", bg_container_id);
                                             if let Err(e) = manager.start(&bg_container_id).await {
                                                 error!("Background: Failed to restart container: {}", e);
@@ -261,16 +272,17 @@ pub async fn create_container(
                                                 if let Some(remote) = &bg_state.remote {
                                                     let remote = remote.clone();
                                                     let uuid = bg_uuid.clone();
-                                                    tokio::spawn(async move { remote.send_install_status(&uuid, "install_failed", Some("restart failed")).await });
+                                                    let request_id = request_id.clone();
+                                                    tokio::spawn(async move { remote.send_install_status_with_container_id_and_id(&uuid, "install_failed", Some("restart failed"), None, request_id.as_deref()).await });
                                                 }
-
                                             } else {
                                                 let _ = bg_state.state_manager.update_container_state(&bg_uuid, "running").await;
 
                                                 if let Some(remote) = &bg_state.remote {
                                                     let remote = remote.clone();
                                                     let uuid = bg_uuid.clone();
-                                                    tokio::spawn(async move { remote.send_install_status(&uuid, "install_success", None).await });
+                                                    let request_id = request_id.clone();
+                                                    tokio::spawn(async move { remote.send_install_status_with_container_id_and_id(&uuid, "install_success", None, None, request_id.as_deref()).await });
                                                 }
                                             }
                                         } else {
@@ -279,10 +291,12 @@ pub async fn create_container(
                                             if let Some(remote) = &bg_state.remote {
                                                 let remote = remote.clone();
                                                 let uuid = bg_uuid.clone();
-                                                tokio::spawn(async move { remote.send_install_status(&uuid, "install_failed", None).await });
+                                                let request_id = request_id.clone();
+                                                tokio::spawn(async move { remote.send_install_status_with_container_id_and_id(&uuid, "install_failed", None, None, request_id.as_deref()).await });
                                             }
                                         }
                                         let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                                        let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
                                         break;
                                     }
                                 }
@@ -291,15 +305,16 @@ pub async fn create_container(
                                 error!("Background: Failed to inspect container {}: {}", bg_container_id, e);
                                 let _ = bg_state.state_manager.update_container_state(&bg_uuid, "failed").await;
                                 let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                                let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
                                 break;
                             }
                         }
                     }
                 } else {
-                    // No install script - just mark as running
                     let _ = bg_state.state_manager.update_container_state(&bg_uuid, "running").await;
+                    let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
                 }
-                
+
                 info!("Background: Container {} lifecycle complete", bg_container_id);
             });
 
@@ -321,12 +336,12 @@ pub async fn create_container(
                 }).collect::<Vec<_>>(),
                 "limits": tracker.limits
             });
-            
+
             Ok(Json(ApiResponse::success(response)))
         }
         Err(e) => {
             error!("Failed to create container: {}", e);
-            let _ = state.state_manager.update_container_state(&custom_uuid, "failed").await;
+            let _ = state.state_manager.clear_operation(&custom_uuid).await;
             Ok(Json(ApiResponse::error(e.to_string())))
         }
     }
@@ -533,6 +548,7 @@ pub async fn restart_container(
 pub async fn recreate_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    req: Option<Json<crate::models::OperationRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Received recreate request for container: {}", id);
     
@@ -545,35 +561,70 @@ pub async fn recreate_container(
     let uuid = state.state_manager.get_uuid_for_container_id(&id)
         .unwrap_or_else(|| id.clone());
     
+    let request_id = req.and_then(|r| r.request_id.clone());
+
+    if let Some(request_id) = request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&uuid, "recreating", Some(request_id), Some("Container recreation in progress"))
+            .await;
+    }
+
     // Spawn background task for recreation using lifecycle manager
     let lifecycle = state.lifecycle.clone();
     let remote = state.remote.clone();
+    let state_manager = state.state_manager.clone();
     let uuid_clone = uuid.clone();
+    let request_id = request_id.clone();
     
     // Notify remote panel that recreation is starting
     if let Some(ref remote) = state.remote {
-        remote.send_install_status(&uuid, "recreating", Some("Container recreation in progress")).await;
+        remote
+            .send_install_status_with_container_id_and_id(
+                &uuid,
+                "recreating",
+                Some("Container recreation in progress"),
+                None,
+                request_id.as_deref(),
+            )
+            .await;
     }
     
     tokio::spawn(async move {
         match lifecycle.recreate_container(&uuid_clone, None).await {
             Ok(new_id) => {
                 info!("Container {} recreated successfully, new ID: {}", uuid_clone, new_id);
-                // Notify remote panel of success
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_success", Some("Container recreated successfully")).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_success",
+                            Some("Container recreated successfully"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
             Err(e) => {
                 error!("Container {} recreation failed: {}", uuid_clone, e);
-                // Notify remote panel of failure
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Recreation failed: {}", e))).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_failed",
+                            Some(&format!("Recreation failed: {}", e)),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
         }
     });
-    
+
     Ok(Json(ApiResponse::success(serde_json::json!({
         "status": "accepted",
         "message": format!("Recreate action initiated for container {}", uuid),
@@ -654,35 +705,6 @@ pub async fn unsuspend_container(
         Ok(Json(ApiResponse::success(format!("Container {} unsuspended: {}. Container is now stopped and can be started.", id, reason))))
     } else {
         Ok(Json(ApiResponse::error("Container not found in daemon state".to_string())))
-    }
-}
-
-
-/// Attach to a container
-pub async fn attach_container(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::models::AttachResponse>>, StatusCode> {
-    info!("Creating shell session for container: {}", id);
-    
-    if let Ok(true) = check_container_suspended(&state, &id) {
-        return Ok(Json(ApiResponse::error("Cannot attach to suspended container".to_string())));
-    }
-    
-    let manager = ContainerManager::new(state.docker.client().clone());
-    match manager.attach(&id).await {
-        Ok(exec_id) => {
-            let response = crate::models::AttachResponse {
-                exec_id,
-                container_id: id,
-                status: "shell_session_created".to_string(),
-            };
-            Ok(Json(ApiResponse::success(response)))
-        }
-        Err(e) => {
-            error!("Failed to create shell session for container {}: {}", id, e);
-            Ok(Json(ApiResponse::error(e.to_string())))
-        }
     }
 }
 
@@ -817,9 +839,27 @@ pub async fn update_container(
             return Ok(Json(ApiResponse::error("Container is currently locked (installing/updating)".to_string())));
         }
         
+        if let Some(request_id) = req.request_id.as_deref() {
+            let _ = state
+                .state_manager
+                .set_operation(&uuid, "updating", Some(request_id), Some("Running update script"))
+                .await;
+        }
+
         // Lock and update state immediately
         let _ = state.state_manager.lock_container(&uuid, "Running update script").await;
         let _ = state.state_manager.update_container_state(&uuid, "updating").await;
+        if let Some(remote) = &state.remote {
+            remote
+                .send_install_status_with_container_id_and_id(
+                    &uuid,
+                    "updating",
+                    Some("Running update script"),
+                    None,
+                    req.request_id.as_deref(),
+                )
+                .await;
+        }
         
         let volumes_path = state.config.storage.volumes_path.clone();
         let startup_cmd = container_state.startup_command.clone()
@@ -830,6 +870,7 @@ pub async fn update_container(
         let bg_state = state.clone();
         let bg_uuid = uuid.clone();
         let bg_docker_id = docker_id.clone();
+        let request_id = req.request_id.clone();
         
         tokio::spawn(async move {
             let docker = bg_state.docker.client().clone();
@@ -847,6 +888,18 @@ pub async fn update_container(
                 error!("Failed to write entrypoint.sh: {}", e);
                 let _ = bg_state.state_manager.update_container_state(&bg_uuid, "update_failed").await;
                 let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
+                if let Some(remote) = &bg_state.remote {
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &bg_uuid,
+                            "update_failed",
+                            Some("Failed to write update script"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
+                }
                 return;
             }
             
@@ -856,6 +909,18 @@ pub async fn update_container(
                 error!("Failed to start container for update: {}", e);
                 let _ = bg_state.state_manager.update_container_state(&bg_uuid, "update_failed").await;
                 let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
+                if let Some(remote) = &bg_state.remote {
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &bg_uuid,
+                            "update_failed",
+                            Some("Failed to start container for update"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
+                }
                 return;
             }
             
@@ -871,6 +936,18 @@ pub async fn update_container(
                     error!("Update timed out for {}", bg_docker_id);
                     let _ = bg_state.state_manager.update_container_state(&bg_uuid, "update_timeout").await;
                     let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                    let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
+                    if let Some(remote) = &bg_state.remote {
+                        remote
+                            .send_install_status_with_container_id_and_id(
+                                &bg_uuid,
+                                "update_timeout",
+                                Some("Update timed out"),
+                                None,
+                                request_id.as_deref(),
+                            )
+                            .await;
+                    }
                     break;
                 }
                 
@@ -891,13 +968,47 @@ pub async fn update_container(
                                     if let Err(e) = manager.start(&bg_docker_id).await {
                                         error!("Failed to restart container: {}", e);
                                         let _ = bg_state.state_manager.update_container_state(&bg_uuid, "failed").await;
+                                        if let Some(remote) = &bg_state.remote {
+                                            remote
+                                                .send_install_status_with_container_id_and_id(
+                                                    &bg_uuid,
+                                                    "update_failed",
+                                                    Some("Failed to restart after update"),
+                                                    None,
+                                                    request_id.as_deref(),
+                                                )
+                                                .await;
+                                        }
                                     } else {
                                         let _ = bg_state.state_manager.update_container_state(&bg_uuid, "running").await;
+                                        if let Some(remote) = &bg_state.remote {
+                                            remote
+                                                .send_install_status_with_container_id_and_id(
+                                                    &bg_uuid,
+                                                    "install_success",
+                                                    Some("Update completed"),
+                                                    None,
+                                                    request_id.as_deref(),
+                                                )
+                                                .await;
+                                        }
                                     }
                                 } else {
                                     let _ = bg_state.state_manager.update_container_state(&bg_uuid, "update_failed").await;
+                                    if let Some(remote) = &bg_state.remote {
+                                        remote
+                                            .send_install_status_with_container_id_and_id(
+                                                &bg_uuid,
+                                                "update_failed",
+                                                Some("Update script failed"),
+                                                None,
+                                                request_id.as_deref(),
+                                            )
+                                            .await;
+                                    }
                                 }
                                 let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                                let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
                                 break;
                             }
                         }
@@ -906,6 +1017,18 @@ pub async fn update_container(
                         error!("Failed to inspect container {}: {}", bg_docker_id, e);
                         let _ = bg_state.state_manager.update_container_state(&bg_uuid, "failed").await;
                         let _ = bg_state.state_manager.unlock_container(&bg_uuid).await;
+                        let _ = bg_state.state_manager.clear_operation(&bg_uuid).await;
+                        if let Some(remote) = &bg_state.remote {
+                            remote
+                                .send_install_status_with_container_id_and_id(
+                                    &bg_uuid,
+                                    "update_failed",
+                                    Some("Update inspection failed"),
+                                    None,
+                                    request_id.as_deref(),
+                                )
+                                .await;
+                        }
                         break;
                     }
                 }
@@ -937,6 +1060,13 @@ pub async fn install_container(
         if container_state.locked.unwrap_or(false) {
             return Ok(Json(ApiResponse::error("Container is currently locked (installing/updating)".to_string())));
         }
+
+        if let Some(request_id) = req.request_id.as_deref() {
+            let _ = state
+                .state_manager
+                .set_operation(&uuid, "installing", Some(request_id), Some("Running install script"))
+                .await;
+        }
         
         let install_script = req.update_content.clone();
         let image = req.image.clone();
@@ -945,14 +1075,24 @@ pub async fn install_container(
         // Spawn reinstall in background with callback to panel
         let lifecycle = state.lifecycle.clone();
         let remote = state.remote.clone();
+        let state_manager = state.state_manager.clone();
         let uuid_clone = uuid.clone();
+        let request_id = req.request_id.clone();
         
         tokio::spawn(async move {
             info!("Background: Starting reinstall for {}", uuid_clone);
             
             // Notify panel that install is starting
             if let Some(ref remote) = remote {
-                remote.send_install_status(&uuid_clone, "installing", None).await;
+                remote
+                    .send_install_status_with_container_id_and_id(
+                        &uuid_clone,
+                        "installing",
+                        None,
+                        None,
+                        request_id.as_deref(),
+                    )
+                    .await;
             }
             
             match lifecycle.reinstall(&uuid_clone, &install_script, image.as_deref(), startup_command.as_ref()).await {
@@ -960,15 +1100,33 @@ pub async fn install_container(
                     info!("Background: Reinstall complete for {}, new container: {}", uuid_clone, new_id);
                     // Notify panel of success
                     if let Some(ref remote) = remote {
-                        remote.send_install_status(&uuid_clone, "install_success", None).await;
+                        remote
+                            .send_install_status_with_container_id_and_id(
+                                &uuid_clone,
+                                "install_success",
+                                None,
+                                None,
+                                request_id.as_deref(),
+                            )
+                            .await;
                     }
+                    let _ = state_manager.clear_operation(&uuid_clone).await;
                 }
                 Err(e) => {
                     error!("Background: Reinstall failed for {}: {}", uuid_clone, e);
                     // Notify panel of failure
                     if let Some(ref remote) = remote {
-                        remote.send_install_status(&uuid_clone, "install_failed", Some(&e)).await;
+                        remote
+                            .send_install_status_with_container_id_and_id(
+                                &uuid_clone,
+                                "install_failed",
+                                Some(&e),
+                                None,
+                                request_id.as_deref(),
+                            )
+                            .await;
                     }
+                    let _ = state_manager.clear_operation(&uuid_clone).await;
                 }
             }
         });
@@ -1037,7 +1195,7 @@ pub async fn get_container_status(
     info!("Getting status for container: {}", id);
     
     // Lock-free lookup - try by container ID first, then by UUID
-    if let Some((uuid, container_state)) = state.state_manager.find_by_container_id(&id) {
+    if let Some((_uuid, container_state)) = state.state_manager.find_by_container_id(&id) {
         let status = InstallationStatus {
             status: container_state.state.clone(),
             progress: container_state.lock_reason.clone(),
@@ -1328,6 +1486,10 @@ pub async fn update_container_config(
             .update_container_startup_command(&uuid, req.startup_command.clone())
             .await;
 
+        if req.request_id.is_some() {
+            let _ = state.state_manager.clear_operation(&uuid).await;
+        }
+
         return Ok(Json(ApiResponse::success(serde_json::json!({
             "status": "ok",
             "message": "Startup command updated. Restart the server for changes to take effect.",
@@ -1335,6 +1497,13 @@ pub async fn update_container_config(
         }))));
     }
     
+    if let Some(request_id) = req.request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&uuid, "recreating", Some(request_id), Some("Applying configuration changes"))
+            .await;
+    }
+
     // Build update request
     let update = crate::services::ContainerUpdateRequest {
         env: req.env,
@@ -1347,11 +1516,21 @@ pub async fn update_container_config(
     // Spawn background task for recreation
     let lifecycle = state.lifecycle.clone();
     let remote = state.remote.clone();
+    let state_manager = state.state_manager.clone();
     let uuid_clone = uuid.clone();
+    let request_id = req.request_id.clone();
     
     // Notify remote panel that config update is starting
     if let Some(ref remote) = state.remote {
-        remote.send_install_status(&uuid, "recreating", Some("Applying configuration changes")).await;
+        remote
+            .send_install_status_with_container_id_and_id(
+                &uuid,
+                "recreating",
+                Some("Applying configuration changes"),
+                None,
+                request_id.as_deref(),
+            )
+            .await;
     }
     
     tokio::spawn(async move {
@@ -1360,15 +1539,33 @@ pub async fn update_container_config(
                 info!("Container {} config updated, new ID: {}", uuid_clone, new_id);
                 // Notify remote panel of success
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_success", Some("Configuration updated successfully")).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_success",
+                            Some("Configuration updated successfully"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
             Err(e) => {
                 error!("Container {} config update failed: {}", uuid_clone, e);
                 // Notify remote panel of failure
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Config update failed: {}", e))).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_failed",
+                            Some(&format!("Config update failed: {}", e)),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
         }
     });
@@ -1392,8 +1589,16 @@ pub async fn update_container_env(
         return Ok(Json(ApiResponse::error("Container is currently locked".to_string())));
     }
     
+    if let Some(request_id) = req.request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&uuid, "recreating", Some(request_id), Some("Updating environment"))
+            .await;
+    }
+
     // Spawn background task
     let lifecycle = state.lifecycle.clone();
+    let state_manager = state.state_manager.clone();
     let uuid_clone = uuid.clone();
     let env = req.env;
     
@@ -1401,9 +1606,11 @@ pub async fn update_container_env(
         match lifecycle.update_env(&uuid_clone, env).await {
             Ok(new_id) => {
                 info!("Container {} env updated, new ID: {}", uuid_clone, new_id);
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
             Err(e) => {
                 error!("Container {} env update failed: {}", uuid_clone, e);
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
         }
     });
@@ -1478,6 +1685,19 @@ pub async fn reinstall_container(
         return Ok(Json(ApiResponse::error("Cannot reinstall suspended container".to_string())));
     }
     
+    let event_hub = state.event_hub.clone();
+    let old_container_id = state
+        .state_manager
+        .get_container(&uuid)
+        .and_then(|c| c.container_id.clone());
+
+    if let Some(request_id) = req.request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&uuid, "installing", Some(request_id), Some("Reinstalling container"))
+            .await;
+    }
+
     // Lock immediately
     if let Err(e) = state.state_manager.lock_container(&uuid, "Reinstalling").await {
         return Ok(Json(ApiResponse::error(format!("Failed to lock: {}", e))));
@@ -1485,10 +1705,21 @@ pub async fn reinstall_container(
     
     // Set state to installing
     state.state_manager.update_container_state(&uuid, "installing").await.ok();
+    if let Some(ref cid) = old_container_id {
+        event_hub.broadcast_state(cid, "installing").await;
+    }
     
     // Notify remote panel that container is locked for reinstall
     if let Some(ref remote) = state.remote {
-        remote.send_install_status(&uuid, "installing", Some("Reinstalling container")).await;
+        remote
+            .send_install_status_with_container_id_and_id(
+                &uuid,
+                "installing",
+                Some("Reinstalling container"),
+                None,
+                req.request_id.as_deref(),
+            )
+            .await;
     }
     
     // SYNCHRONOUS: Create new container and get new ID
@@ -1505,7 +1736,11 @@ pub async fn reinstall_container(
         Err(e) => {
             error!("Reinstall failed for {}: {}", uuid, e);
             state.state_manager.update_container_state(&uuid, "install_failed").await.ok();
+            if let Some(ref cid) = old_container_id {
+                event_hub.broadcast_state(cid, "install_failed").await;
+            }
             state.state_manager.unlock_container(&uuid).await.ok();
+            state.state_manager.clear_operation(&uuid).await.ok();
             return Ok(Json(ApiResponse::error(e)));
         }
     };
@@ -1516,10 +1751,13 @@ pub async fn reinstall_container(
     let remote = state.remote.clone();
     let state_manager = state.state_manager.clone();
     let docker = state.docker.clone();
+    let event_hub = event_hub.clone();
+    let old_cid = old_container_id.clone();
     let uuid_clone = uuid.clone();
     let new_cid = new_container_id.clone();
     let startup_command = req.startup_command.clone();
     let volumes_path = state.config.storage.volumes_path.clone();
+    let request_id = req.request_id.clone();
     
     tokio::spawn(async move {
         // Run install script and startup in background
@@ -1536,18 +1774,30 @@ pub async fn reinstall_container(
             Ok(_) => {
                 info!("Reinstall complete for {}", uuid_clone);
                 state_manager.unlock_container(&uuid_clone).await.ok();
-                if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_success", None).await;
+                // Broadcast install_success to WebSocket clients
+                event_hub.broadcast_state(&new_cid, "install_success").await;
+                if let Some(ref cid) = old_cid {
+                    event_hub.broadcast_state(cid, "install_success").await;
                 }
+                if let Some(ref remote) = remote {
+                    remote.send_install_status_with_container_id_and_id(&uuid_clone, "install_success", None, None, request_id.as_deref()).await;
+                }
+                state_manager.clear_operation(&uuid_clone).await.ok();
             }
             Err(e) => {
                 error!("Reinstall install phase failed for {}: {}", uuid_clone, e);
                 state_manager.unlock_container(&uuid_clone).await.ok();
+                // Broadcast install_failed to WebSocket clients
+                event_hub.broadcast_state(&new_cid, "install_failed").await;
+                if let Some(ref cid) = old_cid {
+                    event_hub.broadcast_state(cid, "install_failed").await;
+                }
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_failed", Some(&e)).await;
+                    remote.send_install_status_with_container_id_and_id(&uuid_clone, "install_failed", Some(&e), None, request_id.as_deref()).await;
                 }
                 state_manager.update_container_state(&uuid_clone, "install_failed").await.ok();
                 state_manager.unlock_container(&uuid_clone).await.ok();
+                state_manager.clear_operation(&uuid_clone).await.ok();
             }
         }
     });
@@ -1581,15 +1831,18 @@ async fn create_reinstall_container(
     
     let old_container_id = tracker.container_id.clone();
     
+    let _ = state_manager.update_operation_message(uuid, Some("Stopping old container")).await;
     // Step 1: Stop old container
     info!("Reinstall: Stopping old container {}", old_container_id);
     let _ = manager.stop(&old_container_id).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Removing old container")).await;
     // Step 2: Remove old container
     info!("Reinstall: Removing old container {}", old_container_id);
     let _ = manager.remove(&old_container_id).await;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Releasing old ports")).await;
     // Step 3: Release old ports
     {
         let mut net_mgr = network.write().await;
@@ -1600,11 +1853,13 @@ async fn create_reinstall_container(
         }
     }
     
+    let _ = state_manager.update_operation_message(uuid, Some("Pulling images for docker" )).await;
     // Step 4: Pull image
     info!("Reinstall: Pulling image {}", req.image);
     manager.pull_image_if_needed(&req.image).await
         .map_err(|e| format!("Failed to pull image: {}", e))?;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Writing install script")).await;
     // Step 5: Setup paths and write install script
     let data_path = format!("{}/{}_data", volumes_path, uuid);
     let entrypoint_path = format!("{}/entrypoint.sh", data_path);
@@ -1622,12 +1877,14 @@ async fn create_reinstall_container(
         let _ = std::fs::set_permissions(&entrypoint_path, std::fs::Permissions::from_mode(0o755));
     }
     
+    let _ = state_manager.update_operation_message(uuid, Some("Preparing port bindings")).await;
     // Step 6: Build port map (reuse existing allocations)
     let ports_map: std::collections::HashMap<String, String> = tracker.allocated_ports
         .iter()
         .map(|p| (p.container_port.clone(), p.host_port.clone()))
         .collect();
     
+    let _ = state_manager.update_operation_message(uuid, Some("Creating new container")).await;
     // Step 7: Create new container
     info!("Reinstall: Creating new container for {}", uuid);
     let create_req = crate::models::CreateContainerRequest {
@@ -1645,6 +1902,7 @@ async fn create_reinstall_container(
         limits: req.limits.clone().or(Some(tracker.limits.clone())),
         install_content: None,
         runtime: req.runtime.clone(),
+        request_id: None,
     };
     
     let (new_container_id, allocations) = manager.create_with_networking(
@@ -1654,6 +1912,7 @@ async fn create_reinstall_container(
         volumes_path,
     ).await.map_err(|e| format!("Failed to create container: {}", e))?;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Updating container tracking" )).await;
     // Step 8: Update tracker with new container ID
     let mut updated_tracker = tracker.clone();
     updated_tracker.container_id = new_container_id.clone();
@@ -1680,18 +1939,23 @@ async fn run_install_and_startup(
 ) -> Result<(), String> {
     let manager = ContainerManager::new(docker.client.clone());
     
+    let _ = state_manager.update_operation_message(uuid, Some("Starting install container")).await;
     // Start container (runs install script)
     info!("Reinstall: Starting container to run install script");
     manager.start(container_id).await
         .map_err(|e| format!("Failed to start container: {}", e))?;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Waiting for install to complete" )).await;
     // Wait for install to complete (max 10 min)
     let install_success = wait_for_container_exit(&docker.client, container_id, 600).await;
     
     if !install_success {
+        state_manager.update_container_state(uuid, "install_failed").await.ok();
+        let _ = state_manager.update_operation_message(uuid, Some("Install failed or timed out")).await;
         return Err("Install script failed or timed out".to_string());
     }
     
+    let _ = state_manager.update_operation_message(uuid, Some("Writing startup command" )).await;
     // Write startup command to entrypoint
     info!("Reinstall: Install complete, writing startup command");
     let data_path = format!("{}/{}_data", volumes_path, uuid);
@@ -1710,6 +1974,7 @@ async fn run_install_and_startup(
     tokio::fs::write(&entrypoint_path, &startup_cmd).await
         .map_err(|e| format!("Failed to write startup command: {}", e))?;
     
+    let _ = state_manager.update_operation_message(uuid, Some("Starting container" )).await;
     // Start container with startup command
     info!("Reinstall: Starting container with startup command");
     if let Err(e) = manager.start(container_id).await {
@@ -1717,6 +1982,7 @@ async fn run_install_and_startup(
         state_manager.update_container_state(uuid, "stopped").await.ok();
     } else {
         state_manager.update_container_state(uuid, "running").await.ok();
+        let _ = state_manager.update_operation_message(uuid, Some("Install complete")).await;
     }
     
     Ok(())

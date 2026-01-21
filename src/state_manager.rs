@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::Notify;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +37,12 @@ pub struct ContainerState {
     pub lock_reason: Option<String>,
     pub locked_at: Option<i64>,
     pub restart_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +348,54 @@ impl StateManager {
             .unwrap_or(false)
     }
 
+    /// Set operation metadata (lock-free)
+    pub async fn set_operation(
+        &self,
+        uuid: &str,
+        operation: &str,
+        operation_id: Option<&str>,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(mut entry) = self.containers.get_mut(uuid) {
+            entry.operation = Some(operation.to_string());
+            entry.operation_id = operation_id.map(|s| s.to_string());
+            entry.operation_message = message.map(|s| s.to_string());
+            entry.updated_at = Utc::now();
+            self.mark_dirty();
+            info!("Set operation for {}: {} (id: {:?})", uuid, operation, entry.operation_id);
+        } else {
+            warn!("Attempted to set operation for non-existent container: {}", uuid);
+        }
+        Ok(())
+    }
+
+    /// Update operation message (lock-free)
+    pub async fn update_operation_message(&self, uuid: &str, message: Option<&str>) -> anyhow::Result<()> {
+        if let Some(mut entry) = self.containers.get_mut(uuid) {
+            entry.operation_message = message.map(|s| s.to_string());
+            entry.updated_at = Utc::now();
+            self.mark_dirty();
+        } else {
+            warn!("Attempted to update operation message for non-existent container: {}", uuid);
+        }
+        Ok(())
+    }
+
+    /// Clear operation metadata (lock-free)
+    pub async fn clear_operation(&self, uuid: &str) -> anyhow::Result<()> {
+        if let Some(mut entry) = self.containers.get_mut(uuid) {
+            entry.operation = None;
+            entry.operation_id = None;
+            entry.operation_message = None;
+            entry.updated_at = Utc::now();
+            self.mark_dirty();
+            info!("Cleared operation metadata for {}", uuid);
+        } else {
+            warn!("Attempted to clear operation for non-existent container: {}", uuid);
+        }
+        Ok(())
+    }
+
     /// Update container limits (lock-free)
     pub async fn update_container_limits(&self, uuid: &str, limits: &crate::models::ResourceLimits) -> anyhow::Result<()> {
         if let Some(mut entry) = self.containers.get_mut(uuid) {
@@ -419,6 +473,9 @@ impl From<&ContainerTracker> for ContainerState {
             lock_reason: None,
             locked_at: None,
             restart_policy: None,
+            operation: None,
+            operation_id: None,
+            operation_message: None,
         }
     }
 }

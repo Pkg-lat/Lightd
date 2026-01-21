@@ -70,6 +70,9 @@ pub enum WsClientMessage {
     /// Switch WebSocket mode (attached/exec)
     #[serde(rename = "set_mode")]
     SetMode(Vec<String>),
+    /// Request log tail (args: [tail])
+    #[serde(rename = "request_logs")]
+    RequestLogs(Vec<String>),
     /// Ping/keepalive
     #[serde(rename = "ping")]
     Ping,

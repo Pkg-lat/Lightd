@@ -5,7 +5,6 @@
 //! Each WebSocket manages its own log/stats streamers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info};
 use serde::{Serialize, Deserialize};

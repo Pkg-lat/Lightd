@@ -6,7 +6,6 @@ use axum::{
     Router,
 };
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
@@ -341,7 +340,7 @@ r#"
         /____/                           
                                                           
 Lightd Daemon v{}
-(c) 2025-present Nadhi.dev
+(c) 2025-present Nadhi.dev (compile timer)
 "#, config.version);
 
   

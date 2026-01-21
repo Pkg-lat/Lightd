@@ -78,7 +78,16 @@ impl ContainerLifecycleManager {
 
         // Notify remote panel that server is locked during recreation
         if let Some(ref remote) = self.remote {
-            remote.send_install_status(uuid, "recreating", Some("Container recreation in progress")).await;
+            let request_id = self.state_manager.get_container(uuid).and_then(|s| s.operation_id);
+            remote
+                .send_install_status_with_container_id_and_id(
+                    uuid,
+                    "recreating",
+                    Some("Container recreation in progress"),
+                    None,
+                    request_id.as_deref(),
+                )
+                .await;
         }
 
         // 2. Load current tracker data
@@ -161,6 +170,7 @@ impl ContainerLifecycleManager {
             limits: new_limits,
             install_content: None,
             runtime: tracker.runtime.clone(),
+            request_id: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -192,7 +202,16 @@ impl ContainerLifecycleManager {
                 
                 // Notify remote panel that recreation succeeded
                 if let Some(ref remote) = self.remote {
-                    remote.send_install_status(uuid, "install_success", Some("Container recreated successfully")).await;
+                    let request_id = self.state_manager.get_container(uuid).and_then(|s| s.operation_id);
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            uuid,
+                            "install_success",
+                            Some("Container recreated successfully"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
                 
                 info!("Lifecycle: Container {} recreation complete, new ID: {}", uuid, new_container_id);
@@ -205,7 +224,16 @@ impl ContainerLifecycleManager {
                 
                 // Notify remote panel that recreation failed
                 if let Some(ref remote) = self.remote {
-                    remote.send_install_status(uuid, "install_failed", Some(&format!("Container recreation failed: {}", e))).await;
+                    let request_id = self.state_manager.get_container(uuid).and_then(|s| s.operation_id);
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            uuid,
+                            "install_failed",
+                            Some(&format!("Container recreation failed: {}", e)),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
                 
                 Err(format!("Failed to create container: {}", e))
@@ -506,6 +534,7 @@ impl ContainerLifecycleManager {
             limits,
             install_content: None,
             runtime: None,
+            request_id: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {
@@ -666,6 +695,7 @@ impl ContainerLifecycleManager {
             limits: Some(tracker.limits.clone()),
             install_content: None,
             runtime: tracker.runtime.clone(),
+            request_id: None,
         };
 
         let (new_container_id, allocations) = manager.create_with_networking(
@@ -927,6 +957,7 @@ impl ContainerLifecycleManager {
             limits: Some(tracker.limits.clone()),
             install_content: None,
             runtime: tracker.runtime.clone(),
+            request_id: None,
         };
 
         match manager.create_with_networking(create_req, &self.network, uuid, &self.volumes_path).await {

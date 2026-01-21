@@ -21,6 +21,9 @@ pub struct CreateContainerRequest {
     /// Runtime config for startup/stop behavior
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfig>,
+    /// Optional request ID from panel for long-running operations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -164,6 +167,8 @@ pub struct UpdateContainerRequest {
     pub image: Option<String>,  // Docker image to use (overrides tracker)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_command: Option<Vec<String>>, // Startup command (overrides tracker)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,6 +308,8 @@ pub struct NetworkStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateEnvRequest {
     pub env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Request to update container configuration (triggers recreation)
@@ -313,6 +320,8 @@ pub struct UpdateConfigRequest {
     pub ports: Option<HashMap<String, String>>,
     pub image: Option<String>,
     pub startup_command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Runtime configuration for detecting server state
@@ -348,6 +357,15 @@ pub struct ReinstallRequest {
     /// Runtime config for state detection
     #[serde(default)]
     pub runtime: Option<RuntimeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// Optional operation metadata for long-running actions
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OperationRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Request for stop action with optional runtime config

@@ -318,6 +318,26 @@ impl ResourceMonitor {
                             if response_json.get("suspended").and_then(|v| v.as_bool()).unwrap_or(false) {
                                 warn!("User is suspended for container {}. Disabling billing.", uuid);
                                 self.billing_disabled.insert(uuid.clone(), ());
+
+                                // Mark container as suspended locally and notify panel so it locks the server
+                                if !self.state_manager.is_container_suspended(uuid) {
+                                    let reason = response_json
+                                        .get("newBalance")
+                                        .and_then(|v| v.as_f64())
+                                        .map(|bal| format!("Insufficient RU balance ({:.4} RU). Please add credits to unsuspend.", bal))
+                                        .unwrap_or_else(|| "Insufficient RU balance. Please add credits to unsuspend.".to_string());
+
+                                    let _ = self.state_manager.suspend_container(uuid, &reason).await;
+
+                                    if let Some(remote_cfg) = self.remote_config.clone() {
+                                        let remote = crate::remote::Remote::new(Some(remote_cfg));
+                                        if remote.is_enabled() {
+                                            remote
+                                                .send_install_status_with_container_id_and_id(uuid, "suspended", Some(&reason), None, None)
+                                                .await;
+                                        }
+                                    }
+                                }
                             }
                         }
 

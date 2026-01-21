@@ -459,6 +459,7 @@ pub async fn get_all_port_allocations(
 pub async fn apply_port_changes(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
+    req: Option<Json<crate::models::OperationRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     info!("Applying port changes for container: {}", uuid);
     
@@ -482,15 +483,34 @@ pub async fn apply_port_changes(
     
     info!("Found container {} with {} ports, triggering recreation", uuid, tracker.allocated_ports.len());
     
+    let request_id = req.and_then(|r| r.request_id.clone());
+
+    if let Some(request_id) = request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&uuid, "recreating", Some(request_id), Some("Applying port changes"))
+            .await;
+    }
+
     // Notify remote panel that port changes are starting
     if let Some(ref remote) = state.remote {
-        remote.send_install_status(&uuid, "recreating", Some("Applying port changes")).await;
+        remote
+            .send_install_status_with_container_id_and_id(
+                &uuid,
+                "recreating",
+                Some("Applying port changes"),
+                None,
+                request_id.as_deref(),
+            )
+            .await;
     }
     
     // Spawn background task for recreation
     let lifecycle = state.lifecycle.clone();
     let remote = state.remote.clone();
+    let state_manager = state.state_manager.clone();
     let uuid_clone = uuid.clone();
+    let request_id = request_id.clone();
     
     tokio::spawn(async move {
         info!("Background task started for container {} recreation", uuid_clone);
@@ -499,15 +519,33 @@ pub async fn apply_port_changes(
                 info!("Port changes applied for {}, new container ID: {}", uuid_clone, new_id);
                 // Notify remote panel of success
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_success", Some("Port changes applied")).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_success",
+                            Some("Port changes applied"),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
             Err(e) => {
                 error!("Failed to apply port changes for {}: {}", uuid_clone, e);
                 // Notify remote panel of failure
                 if let Some(ref remote) = remote {
-                    remote.send_install_status(&uuid_clone, "install_failed", Some(&format!("Port change failed: {}", e))).await;
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            &uuid_clone,
+                            "install_failed",
+                            Some(&format!("Port change failed: {}", e)),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
                 }
+                let _ = state_manager.clear_operation(&uuid_clone).await;
             }
         }
     });

@@ -33,6 +33,7 @@ pub struct CloneVolumeRequest {
 #[derive(Debug, Deserialize)]
 pub struct SwapMountRequest {
     pub new_volume_id: String,
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,11 +254,19 @@ pub async fn swap_container_mount(
     let old_volume_path = format!("{}/{}", state.config.storage.volumes_path, container_uuid);
     let new_volume_path = new_volume.path.clone();
     
+    if let Some(request_id) = req.request_id.as_deref() {
+        let _ = state
+            .state_manager
+            .set_operation(&container_uuid, "recreating", Some(request_id), Some("Swapping /home/container volume"))
+            .await;
+    }
+
     // Use lifecycle manager to recreate with new volume
     match state.lifecycle.swap_mount(&container_uuid, &new_volume_path).await {
         Ok(new_container_id) => {
             // Update volume attachment status
             let _ = volume_manager.set_attached(&req.new_volume_id, Some(&container_uuid)).await;
+            let _ = state.state_manager.clear_operation(&container_uuid).await;
             
             Ok(Json(ApiResponse::success(SwapMountResponse {
                 container_uuid: container_uuid.clone(),
@@ -269,6 +278,7 @@ pub async fn swap_container_mount(
         }
         Err(e) => {
             error!("Failed to swap mount for container {}: {}", container_uuid, e);
+            let _ = state.state_manager.clear_operation(&container_uuid).await;
             Ok(Json(ApiResponse::error(format!("Failed to swap mount: {}", e))))
         }
     }
