@@ -571,6 +571,26 @@ impl ContainerLifecycleManager {
                 self.container_tracker.save_container(&tracker).await.ok();
 
                 self.unlock_container(uuid).await;
+
+                // Notify remote panel that install completed (or failed) so it unlocks
+                if let Some(ref remote) = self.remote {
+                    let request_id = self.state_manager.get_container(uuid).and_then(|s| s.operation_id);
+                    let status = if install_result == Some(false) { "install_failed" } else { "install_success" };
+                    let message = if install_result == Some(false) {
+                        Some("Install failed")
+                    } else {
+                        Some("Install complete")
+                    };
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            uuid,
+                            status,
+                            message,
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
+                }
                 
                 if install_result == Some(false) {
                     info!("Lifecycle: Container {} created but install failed - container is available for retry", uuid);
@@ -584,6 +604,19 @@ impl ContainerLifecycleManager {
                 error!("Lifecycle: Failed to create final container: {}", e);
                 self.state_manager.update_container_state(uuid, "failed").await.ok();
                 self.unlock_container(uuid).await;
+
+                if let Some(ref remote) = self.remote {
+                    let request_id = self.state_manager.get_container(uuid).and_then(|s| s.operation_id);
+                    remote
+                        .send_install_status_with_container_id_and_id(
+                            uuid,
+                            "install_failed",
+                            Some(&format!("Failed to create container: {}", e)),
+                            None,
+                            request_id.as_deref(),
+                        )
+                        .await;
+                }
                 Err(format!("Failed to create container: {}", e))
             }
         }
